@@ -68,7 +68,7 @@ function Find-CompatiblePython {
 }
 
 if (-not (Test-Administrator)) {
-    throw "请右键 install-python-windows.cmd，选择“以管理员身份运行”。"
+    throw "请右键 install-python-windows.cmd，选择以管理员身份运行。"
 }
 
 $ExistingPython = Find-CompatiblePython
