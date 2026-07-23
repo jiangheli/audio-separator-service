@@ -1,0 +1,2 @@
+"""Queue worker entrypoint."""
+

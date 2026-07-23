@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+set -eu
+
+cd "$(dirname "$0")"
+published_api="$(docker compose port backend 8000 2>/dev/null | tail -n 1)"
+api_port="${published_api##*:}"
+api_port="${api_port:-8000}"
+exec docker compose exec -T \
+  -e "STEMFLOW_PUBLIC_API_URL=http://localhost:${api_port}" \
+  backend stemflow "$@"

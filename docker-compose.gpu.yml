@@ -1,0 +1,18 @@
+services:
+  backend:
+    environment:
+      AUDIO_SERVICE_WORKER_CONCURRENCY: ${AUDIO_SERVICE_GPU_WORKER_CONCURRENCY:-1}
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gpu
+    command: ["python3", "-m", "app.worker.main"]
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      AUDIO_SERVICE_WORKER_CONCURRENCY: ${AUDIO_SERVICE_GPU_WORKER_CONCURRENCY:-1}
+      AUDIO_SERVICE_DEFAULT_MODEL: model_bs_roformer_ep_317_sdr_12.9755.ckpt
+      AUDIO_SERVICE_MDX_SEGMENT_SIZE: 256
+      AUDIO_SERVICE_MDXC_OVERRIDE_MODEL_SEGMENT_SIZE: "false"
