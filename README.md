@@ -56,6 +56,11 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
   -Mode "cpu"
 ```
 
+如果 Windows Server 没有 Python 且没有 `winget`，先右键
+`install-python-windows.cmd`，选择“以管理员身份运行”。该脚本会从 Python
+官网下载 Python 3.12 x64、验证数字签名、静默安装并检查版本。完成后再运行
+`install-windows.ps1`。
+
 GPU 安装：
 
 ```powershell

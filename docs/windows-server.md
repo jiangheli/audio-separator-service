@@ -14,6 +14,15 @@
 
 ## 2. 安装
 
+如果服务器没有 Python 3.10–3.12，而且没有 `winget`，先在资源管理器中右键：
+
+```text
+install-python-windows.cmd
+```
+
+选择“以管理员身份运行”。脚本会从 Python 官网下载 Python 3.12 x64、验证
+安装包数字签名、静默安装并检查版本。安装成功后继续执行下面的项目安装命令。
+
 用管理员 PowerShell：
 
 ```powershell
