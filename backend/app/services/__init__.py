@@ -1,2 +1,1 @@
-"""Shared media processing services used by API, worker and CLI."""
-
+"""Video audio extraction, vocal separation and composition services."""

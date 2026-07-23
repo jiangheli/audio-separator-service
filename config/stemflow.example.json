@@ -1,0 +1,14 @@
+{
+  "input_dir": "D:\\StemFlow\\input",
+  "output_dir": "D:\\StemFlow\\output",
+  "data_dir": "D:\\StemFlow\\data",
+  "model": "mdx",
+  "schedule_time": "00:00",
+  "stable_seconds": 120,
+  "max_retries": 3,
+  "output_suffix": "_vocals_only",
+  "audio_bitrate": "192k",
+  "recursive": true,
+  "keep_failed_work": false,
+  "video_copy": true
+}

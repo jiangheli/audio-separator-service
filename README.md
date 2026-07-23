@@ -1,364 +1,239 @@
-# StemFlow · Audio Separator Service
+# StemFlow Video BGM Remover
 
-StemFlow 把开源项目 [python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator) 封装成一个本地部署的 AI 人声分离服务。用户可以通过 Web 选择文件夹，也可以通过 CLI 批量处理视频和音频；两种入口共用同一个 `AudioSeparatorService`，没有复制或修改上游模型推理代码。
+Windows Server 无人值守视频去 BGM 工具。系统定时扫描固定文件夹，使用
+[`python-audio-separator`](https://github.com/nomadkaraoke/python-audio-separator)
+分离人声，然后把人声音轨重新合成到原视频画面中。
 
-## 能力
-
-- 扫描目录中的 `mp4`、`mov`、`mkv`、`avi`、`mp3`、`wav`、`flac`、`m4a`、`ogg`
-- 视频通过 FFmpeg 自动提取 44.1 kHz 双声道 WAV 音轨
-- 通过上游公开 Python API `Separator.load_model()` / `Separator.separate()` 完成人声分离
-- 输出固定整理为 `<output>/<文件名>/vocals.wav` 与 `instrumental.wav`
-- Web 支持本地路径和浏览器整文件夹上传、实时进度、试听与下载
-- CLI 支持单文件与目录批处理，并提供面向 AI/Agent 的稳定 JSON 协议、任务等待和结果下载
-- SQLite 保存任务、文件状态、日志和结果索引；Redis 连接 API 与独立 worker
-- 支持任务级和同一批次文件级并发；每个推理槽位拥有独立模型实例
-- 支持固定文件夹定时扫描、文件稳定检测、去重、失败重试和 Excel 状态表
-- Windows、macOS 与 Linux 均可通过 Docker Compose 运行；Windows 另提供 PowerShell 一键脚本
-- Docker Compose 默认 CPU 运行，可切换 NVIDIA CUDA worker
-
-## 一键启动（CPU）
-
-需要 Docker Desktop / Docker Engine 和 Docker Compose。
-
-```bash
-cd audio-separator-service
-docker compose up --build
-```
-
-打开：
-
-- Web 管理界面：<http://localhost:3000>
-- API 文档：<http://localhost:8000/docs>
-
-把待处理文件放入 `data/input/`，Web 中使用默认输入 `/input` 和输出 `/output`；也可以在 Web 中点击“上传文件夹”，直接上传本机目录。
-
-> 第一次选择某个模型时会从上游模型源下载权重，并缓存到 `data/models/`。下载时间取决于模型体积和网络速度。
-
-## Windows 一键启动
-
-推荐 Windows 10/11 使用 Docker Desktop 的 WSL 2 Linux 容器后端。双击 `start-windows.cmd` 会以 CPU 模式启动，并把项目的 `data/input` 与 `data/output` 映射为 Web 中的 `/input` 和 `/output`。
-
-也可以在 PowerShell 中指定任意 Windows 文件夹：
-
-```powershell
-.\start-windows.cmd `
-  -InputPath "D:\Videos" `
-  -OutputPath "D:\StemFlow-Results"
-```
-
-使用 NVIDIA GPU：
-
-```powershell
-.\start-windows.cmd -Mode gpu `
-  -InputPath "D:\Videos" `
-  -OutputPath "D:\StemFlow-Results"
-```
-
-脚本会检查 Docker、等待 API 健康，并在 GPU 模式下输出容器内的 CUDA 检测结果。停止服务时双击 `stop-windows.cmd`；模型、结果和任务记录不会被删除。完整说明及故障排查见 [Windows 部署指南](docs/windows.md)。
-
-## NVIDIA GPU 启动
-
-主机需要 NVIDIA 驱动、Docker 和 NVIDIA Container Toolkit。
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
-```
-
-GPU 配置只替换推理 worker，Web、API、任务数据库和 Redis 保持不变。可用以下命令检查容器是否识别到 CUDA：
-
-```bash
-docker compose exec worker python3 -c "import onnxruntime as ort; print(ort.get_available_providers())"
-```
-
-输出包含 `CUDAExecutionProvider` 才表示 ONNX 模型会使用 NVIDIA GPU。Demucs / Roformer 是否使用 CUDA还取决于容器内 PyTorch 的 CUDA 可用性。
-
-## 并发处理
-
-CPU 部署默认启动2个独立推理槽位，同一批次中的不同音频、不同任务中的音频都可以被并行领取：
-
-```bash
-AUDIO_SERVICE_WORKER_CONCURRENCY=4 docker compose up -d --build
-```
-
-每个槽位都会独立加载并缓存一份模型，所以并发数也会近似成倍增加内存占用。建议：
-
-| 环境 | 建议并发 |
-| --- | ---: |
-| 8 GB Docker 内存、CPU MDX | 1–2 |
-| 16 GB Docker内存、CPU MDX | 2–4 |
-| 单张8 GB NVIDIA GPU、Roformer | 1 |
-| 16–24 GB NVIDIA GPU | 1–2，需观察显存 |
-
-GPU Compose 默认保持1并发。确认显存充足后可显式提高：
-
-```bash
-AUDIO_SERVICE_GPU_WORKER_CONCURRENCY=2 \
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
-```
-
-`GET /api/health` 和 `stemflow health --json` 会返回当前配置的 `worker_concurrency`。任务列表中的多个 item 可以同时显示为 `extracting_audio` 或 `separating`。Redis 负责文件级作业分发，SQLite 使用 WAL 和忙等待保护并发状态写入，输出目录通过原子预留避免同名文件互相覆盖。
-
-## 固定文件夹自动处理
-
-打开 Web 的“自动处理”面板，设置监控目录、输出目录和执行时间，保存并启用即可进入无人值守模式。计划由 FastAPI 后台服务执行，Web 页面关闭后不会停止。Docker 默认路径：
+最终产物是视频，不再交付 `vocals.wav` 或 `instrumental.wav`：
 
 ```text
-监控目录：/input
-输出目录：/output
-Excel：  /data/processing_status.xlsx
+原视频画面 + AI 分离的人声音轨 = *_vocals_only.mp4
 ```
 
-默认按北京时间每天 `00:00` 扫描一次；也可以切换为按分钟间隔执行。文件最后修改时间超过60秒才会入队，避免处理尚未复制完成的文件。系统使用“绝对路径＋文件大小＋修改时间”生成文件版本指纹：
+## 工作流程
 
-- 相同版本只处理一次；
-- 同一路径文件发生变化后会作为新版本处理；
-- 默认失败最多自动重试3次；
-- 子目录结构会保留到输出目录；
-- 原始文件不会被修改或删除。
-
-自动发现的每个文件都会复用现有 Redis 任务队列，因此仍受 `AUDIO_SERVICE_WORKER_CONCURRENCY` 控制。数据库是可靠状态源，Excel 是便于人工审阅的同步报表，包含等待、处理中、完成、失败、重试次数、结果路径、耗时和错误信息。
-
-也可以通过环境变量提供首次启动默认值：
-
-```bash
-AUDIO_SERVICE_AUTOMATION_ENABLED=true \
-AUDIO_SERVICE_AUTOMATION_SCHEDULE_MODE=daily \
-AUDIO_SERVICE_AUTOMATION_DAILY_TIME=00:00 \
-AUDIO_SERVICE_AUTOMATION_TIMEZONE=Asia/Shanghai \
-AUDIO_SERVICE_AUTOMATION_STABLE_SECONDS=60 \
-AUDIO_SERVICE_AUTOMATION_MAX_RETRIES=3 \
-docker compose up -d --build
+```text
+Windows Task Scheduler
+        ↓
+扫描固定输入目录
+        ↓
+等待文件复制完成
+        ↓
+临时提取原视频音频
+        ↓
+python-audio-separator 分离 vocals
+        ↓
+FFmpeg 删除原音轨并合成 vocals
+        ↓
+输出 *_vocals_only.mp4
+        ↓
+更新 SQLite、Excel 和滚动日志
+        ↓
+删除全部临时 WAV/stems
 ```
 
-为避免升级后意外处理已有 `/input` 内容，默认 `AUDIO_SERVICE_AUTOMATION_ENABLED=false`；在 Web 保存启用后，配置会持久化到 SQLite。启用每日计划不会立即运行，首次执行安排在下一个设定时间；需要立刻补跑时使用“立即扫描”。
+系统没有 Web UI、FastAPI、Redis 或 Docker 依赖。任务由 Windows 计划任务直接调用本机 Python 环境；关闭 PowerShell 窗口不影响以后定时执行。
 
-## CLI
+## Windows Server 一键安装
 
-CLI 1.0 新增 `stemflow` 命令。AI/Agent 推荐通过 stdin 发送一个 JSON 请求，stdout 只会返回一个 JSON 信封：
+要求：
 
-```bash
-printf '%s' '{"action":"health"}' | stemflow agent
-```
+- Windows Server 2019/2022/2025 或 Windows 10/11；
+- 管理员 PowerShell；
+- CPU 模式建议 8 核、16 GB 内存；
+- GPU 模式需要 NVIDIA 驱动，建议至少 8 GB 显存；
+- 首次安装和首次模型推理需要联网。
 
-服务使用 Docker 运行时，可以直接通过项目根目录包装命令调用：
-
-```bash
-./stemflow capabilities --json       # macOS / Linux
-.\stemflow.cmd capabilities --json  # Windows
-```
-
-支持 `capabilities`、本机 `separate`、`task create/get/wait/files/logs/download` 等完整能力。JSON Schema、退出码、路径规则、Python/TypeScript 调用示例和 Agent 重试策略见 [StemFlow CLI 与 AI Agent 接入指南](docs/cli-for-ai.md)。原来的 `audio-separator-service --input ...` 命令保持兼容。
-
-### Docker 内运行
-
-```bash
-docker compose run --rm backend audio-separator-service \
-  --input /input \
-  --output /output \
-  --model default
-```
-
-### 本机安装
-
-要求 Python 3.10+ 和 FFmpeg：
-
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[cpu]"
-audio-separator-service --input ./videos --output ./results
-```
-
-单文件和文件夹使用同一命令：
-
-```bash
-audio-separator-service --input ./video.mp4 --output ./result
-audio-separator-service --input ./videos --output ./results --model mdx
-audio-separator-service --input ./long.wav --output ./results --chunk-duration 600
-```
-
-使用 `--json` 可输出机器可读的结果列表。
-
-### Windows 原生 CLI
-
-双击 `setup-cli-windows.cmd`。脚本会创建隔离环境、安装 CPU 推理依赖，并提供自带的 Windows FFmpeg，不要求用户另外配置 FFmpeg：
+在管理员 PowerShell 中进入项目目录：
 
 ```powershell
-.\.venv-windows\Scripts\audio-separator-service.exe `
-  --input "C:\Users\me\Videos" `
-  --output "D:\StemFlow-Results" `
-  --model mdx
+Set-ExecutionPolicy Bypass -Scope Process -Force
+
+.\install-windows.ps1 `
+  -InputPath "D:\VideoInput" `
+  -OutputPath "D:\VideoOutput" `
+  -ScheduleTime "00:00" `
+  -Mode "cpu"
 ```
 
-Windows 原生 CLI 不需要 Redis。需要 NVIDIA GPU 时推荐使用上面的 Docker GPU 模式，避免 Windows 本机 CUDA、PyTorch 与 ONNX Runtime 版本组合不一致。
+GPU 安装：
 
-## 模型配置
-
-| 参数 | 上游模型 | 适用场景 |
-| --- | --- | --- |
-| `default` / `roformer` | `model_bs_roformer_ep_317_sdr_12.9755.ckpt` | 默认，人声分离质量优先 |
-| `mdx` / `uvr` | `UVR-MDX-NET-Inst_HQ_3.onnx` | ONNX，速度与质量均衡 |
-| `demucs` | `htdemucs_ft.yaml` | Demucs v4，多音轨后合成为伴奏 |
-
-默认 Docker CPU 配置使用 MDX，以避免在约 8 GB Docker 内存下加载 Roformer 时被系统终止；它适合兼容运行，但复杂影视对白中可能残留配乐。NVIDIA GPU 覆盖配置会把 `default` 切换为高质量 Roformer。Apple Silicon 可在 macOS 原生 Python 环境中使用 MPS 运行 Roformer，质量通常明显优于 Docker CPU 的 MDX。可通过 `AUDIO_SERVICE_DEFAULT_MODEL`、`AUDIO_SERVICE_MDX_SEGMENT_SIZE`、`AUDIO_SERVICE_MDXC_SEGMENT_SIZE` 和 `AUDIO_SERVICE_MDXC_OVERRIDE_MODEL_SEGMENT_SIZE` 调整。
-
-也可以把上游 `--list_models` 中的模型文件名直接作为 `model` 传入。上游会在第一次加载时自动下载模型。两音轨模型直接生成 `vocals.wav` 和 `instrumental.wav`；多音轨模型的非人声 stems 会由 FFmpeg 混合为 `instrumental.wav`，推理本身不做修改。
-
-## API
-
-### 创建任务
-
-```http
-POST /api/tasks
-Content-Type: application/json
-
-{
-  "input_dir": "/input",
-  "output_dir": "/output",
-  "model": "default"
-}
+```powershell
+.\install-windows.ps1 `
+  -InputPath "D:\VideoInput" `
+  -OutputPath "D:\VideoOutput" `
+  -ScheduleTime "00:00" `
+  -Mode "gpu"
 ```
 
-返回 HTTP `202`：
+脚本会：
 
-```json
-{
-  "id": "f7c7...",
-  "status": "waiting",
-  "progress": 0,
-  "current_file": null,
-  "input_dir": "/input",
-  "output_dir": "/output",
-  "model": "default",
-  "total_files": 0,
-  "completed_files": 0,
-  "failed_files": 0,
-  "created_at": "2026-07-22T10:00:00Z",
-  "started_at": null,
-  "finished_at": null,
-  "error": null
-}
+1. 检测 Python 3.10–3.12，缺失时尝试通过 `winget` 安装 Python 3.12；
+2. 创建 `.venv-windows` 隔离环境；
+3. 安装 `python-audio-separator`、ONNX Runtime 和内置 FFmpeg；
+4. GPU 模式安装 CUDA PyTorch 并验证 `torch.cuda.is_available()`；
+5. 生成 `config\stemflow.json`；
+6. 注册每天运行的 `StemFlow-Video-BGM-Removal` 计划任务；
+7. 设置 `IgnoreNew`，上一批未完成时不会启动重叠任务；
+8. 验证配置、模型运行库和 FFmpeg。
+
+默认计划任务以 `SYSTEM` 身份运行，因此服务器无人登录时也能执行。`SYSTEM`
+通常无法访问需要个人凭证的网络共享；UNC/NAS 路径请改用专用服务账号。
+
+## 立即运行
+
+安装后无需等待凌晨：
+
+```powershell
+.\run-now.ps1
 ```
 
-### 查询
+兼容入口：
 
-- `GET /api/tasks`：任务列表
-- `GET /api/tasks/{id}`：任务进度与当前文件
-- `GET /api/tasks/{id}/items`：每个输入文件的状态与耗时
-- `GET /api/tasks/{id}/files`：原文件、人声、伴奏的播放和下载地址
-- `GET /api/tasks/{id}/logs`：任务日志
-- `POST /api/uploads`：浏览器文件夹上传
-- `GET /api/health`：服务状态
-- `GET /api/automation`：自动处理配置和汇总状态
-- `PUT /api/automation`：保存并启用/关闭自动处理
-- `POST /api/automation/scan`：立即扫描
-- `POST /api/automation/retry-failed`：重新提交失败文件
-- `GET /api/automation/files`：自动处理文件记录
-- `GET /api/automation/report`：下载 `processing_status.xlsx`
+```cmd
+start-windows.cmd
+```
 
-## 输出结构
+只处理本轮前两个待处理视频：
+
+```powershell
+.\run-now.ps1 -MaxFiles 2
+```
+
+## 查看状态
+
+```powershell
+.\status.ps1
+.\status.ps1 -Json
+```
+
+运行状态保存在：
 
 ```text
-data/output/
-├── video1/
-│   ├── vocals.wav
-│   └── instrumental.wav
-├── video2/
-│   ├── vocals.wav
-│   └── instrumental.wav
-└── album/
-    └── audio1/
-        ├── vocals.wav
-        └── instrumental.wav
+data\
+├── processing.db
+├── processing_status.xlsx
+├── logs\
+│   └── stemflow-video.log
+├── models\
+└── work\
 ```
 
-输入目录存在子目录时，输出会保留相对目录。若同一目录中出现同名但扩展名不同的媒体，会自动追加扩展名避免覆盖。
+日志每天轮换，保留 30 天。Excel 包含源文件、状态、重试次数、处理耗时、输出视频和错误信息。如果 Excel 正在被桌面 Excel 独占打开，本轮视频处理仍会继续，日志会提示关闭文件后重新生成：
 
-## 架构
-
-```mermaid
-flowchart TD
-    UI[React Web UI] --> API[FastAPI]
-    TIMER[Folder Scheduler] --> API
-    CLI[CLI] --> SVC[AudioSeparatorService]
-    API --> DB[(SQLite)]
-    API --> REDIS[(Redis Queue)]
-    REDIS --> WORKER[Audio Separator Worker]
-    WORKER --> SVC
-    SVC --> SCAN[File Scanner]
-    SVC --> FFMPEG[FFmpeg Extractor]
-    SVC --> ENGINE[python-audio-separator]
-    ENGINE --> HW[CPU / CUDA / Apple MPS]
-    WORKER --> DB
-    API --> XLSX[Excel Status Report]
+```powershell
+.\.venv-windows\Scripts\stemflow-video.exe report `
+  --config .\config\stemflow.json
 ```
 
-核心目录：
+## 输入和输出
+
+输入：
 
 ```text
-audio-separator-service/
-├── backend/
-│   ├── app/api/             # FastAPI 路由
-│   ├── app/cli/             # CLI 入口
-│   ├── app/services/        # scanner / extractor / separator / automation / task processor
-│   ├── app/worker/          # Redis worker
-│   └── tests/
-├── frontend/                # React + TypeScript + TailwindCSS
-├── scripts/windows/         # Windows Docker 与 CLI PowerShell 脚本
-├── data/                    # 输入、输出、上传、模型和任务数据库
-├── docker-compose.yml       # CPU
-└── docker-compose.gpu.yml   # NVIDIA CUDA 覆盖配置
+D:\VideoInput\
+├── video1.mp4
+├── video2.mov
+└── series\
+    └── video3.mkv
 ```
 
-## 本地开发
+输出保持相对目录结构：
 
-后端：
-
-```bash
-cd backend
-pip install -e ".[cpu,dev]"
-AUDIO_SERVICE_DATA_DIR=../data AUDIO_SERVICE_TASK_MODE=local \
-  uvicorn app.main:app --reload --port 8000
+```text
+D:\VideoOutput\
+├── video1_vocals_only.mp4
+├── video2_vocals_only.mp4
+└── series\
+    └── video3_vocals_only.mp4
 ```
 
-前端：
+支持：`mp4`、`mov`、`mkv`、`avi`、`m4v`、`webm`。
 
-```bash
-cd frontend
-npm install
-npm run dev
+视频画面优先使用 FFmpeg stream copy，不重新编码；如果原视频编码无法装入 MP4，自动回退为 H.264。新音轨编码为 AAC 44.1 kHz 双声道。人声长度不足时自动补静音，保持完整视频时长。
+
+## 去重、重试和长任务保护
+
+- 指纹由绝对路径、大小和修改时间生成；
+- 相同版本视频成功后不会重复处理；
+- 同一路径的视频被替换后会作为新版本处理；
+- 默认等待文件最后修改时间稳定 120 秒，避免处理尚未复制完成的视频；
+- 默认失败后重试 3 次；
+- 进程异常中断的任务会在下一次运行时标记失败并重试；
+- Python 文件锁和计划任务 `IgnoreNew` 双重防止批次重叠；
+- 输出视频缺失时会自动重建；
+- 原视频永远只读，不删除、不移动、不覆盖。
+
+## 配置
+
+安装脚本生成的 `config\stemflow.json` 不进入 Git。模板见
+[`config/stemflow.example.json`](config/stemflow.example.json)。
+
+主要字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `input_dir` | 固定监控目录 |
+| `output_dir` | 最终视频目录 |
+| `data_dir` | 日志、模型、状态和临时文件目录 |
+| `model` | `mdx`、`roformer` 或上游模型文件名 |
+| `schedule_time` | 每天执行时间，24 小时制 |
+| `stable_seconds` | 文件稳定等待秒数 |
+| `max_retries` | 首次失败后的重试次数 |
+| `output_suffix` | 默认 `_vocals_only` |
+| `video_copy` | 优先直拷视频画面 |
+| `keep_failed_work` | 是否保留失败任务的临时 WAV |
+
+CPU 默认使用 `mdx`，内存压力较低。GPU 默认使用 `roformer`，复杂影视对白中通常能得到更干净的人声。模型推理逻辑没有修改，StemFlow 只负责扫描、状态、FFmpeg 临时提取和视频重组。
+
+## 卸载
+
+仅删除计划任务，保留模型、日志、数据库和结果：
+
+```powershell
+.\uninstall-windows.ps1
 ```
 
-开发模式的 Vite 会把 `/api` 转发到 `localhost:8000`。`TASK_MODE=local` 时 FastAPI 会在本进程后台运行任务，适合调试；Compose 使用 Redis 和独立 worker。
+同时删除 Python 环境：
 
-运行测试：
-
-```bash
-cd backend && pytest
-cd frontend && npm run build
+```powershell
+.\uninstall-windows.ps1 -RemoveEnvironment
 ```
 
-## 上游集成说明
+删除全部运行数据需要明确添加：
 
-本项目开发时核对的上游提交为 `4fe3540c249ff130bd5395c0e9377b3d16970c1a`。分析确认：
+```powershell
+.\uninstall-windows.ps1 -RemoveEnvironment -RemoveData
+```
 
-1. 公开 API 为 `from audio_separator.separator import Separator`。
-2. `Separator(output_dir=..., model_file_dir=..., output_format="WAV")` 负责设备检测和输出配置。
-3. `load_model(model_filename=...)` 负责模型查找、首次下载与架构实例化。
-4. `separate(audio_path, custom_output_names=...)` 返回生成的 stem 路径。
-5. 上游当前覆盖 MDX、VR、Demucs 与 MDXC / Roformer，并提供 CPU、CUDA、CoreML 等执行路径。
+卸载脚本支持 PowerShell `-WhatIf`。
 
-StemFlow 只在外层负责扫描、FFmpeg、任务、状态、固定结果命名和 UI，不修改上游 architecture、模型加载或前向推理代码。
+## 项目结构
 
-## 运行边界
+```text
+audio-separator-service\
+├── backend\
+│   ├── app\
+│   │   ├── cli\
+│   │   ├── services\
+│   │   ├── config.py
+│   │   ├── repository.py
+│   │   ├── report.py
+│   │   └── runner.py
+│   ├── tests\
+│   └── pyproject.toml
+├── config\
+│   └── stemflow.example.json
+├── scripts\windows\
+│   ├── install.ps1
+│   ├── run-now.ps1
+│   ├── status.ps1
+│   └── uninstall.ps1
+├── install-windows.ps1
+├── run-now.ps1
+├── status.ps1
+└── uninstall-windows.ps1
+```
 
-- Docker 容器只能访问挂载到容器中的路径。默认输入与输出为 `/input`、`/output`；任务数据库、模型缓存和上传文件仍位于 `/data`。
-- Windows 启动脚本会把 `C:\...` 或 `D:\...` 转换为 Docker Desktop 可挂载的路径。Web 表单始终填写容器路径 `/input`、`/output`，不能直接填写 Windows 盘符。
-- 浏览器不能直接把任意本机绝对路径暴露给网页；“上传文件夹”会把文件复制到服务的 `data/uploads/` 后再处理。
-- 首次真实推理需要下载较大的模型文件。单元测试使用轻量替身验证流程，不会下载模型或消耗 GPU。
-- 生产部署到非可信网络前，应在反向代理层增加登录、TLS、上传大小限制和允许目录白名单。本项目默认面向本机或可信局域网。
-
-## License
-
-本封装代码采用 MIT License。`python-audio-separator` 及模型文件遵循各自的上游许可与使用条款。
+更完整的 Windows Server 运维说明见
+[`docs/windows-server.md`](docs/windows-server.md)。
