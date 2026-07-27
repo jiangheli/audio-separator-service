@@ -1,6 +1,7 @@
 .DS_Store
 config/stemflow.json
 .venv/
+.venv-dev/
 .venv-macos/
 .venv-windows/
 **/__pycache__/
@@ -9,6 +10,12 @@ config/stemflow.json
 *.log
 backend/dist/
 backend/*.egg-info/
+frontend/dist/
+frontend/node_modules/
+frontend/*.tsbuildinfo
+build/
+dist/
+packaging/windows/bundle/
 outputs/
 data/**
 !data/input/

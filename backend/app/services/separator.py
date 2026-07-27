@@ -68,6 +68,7 @@ class PythonAudioSeparatorEngine:
                     model_file_dir=str(self.model_dir),
                     output_dir=str(output_dir),
                     output_format="WAV",
+                    output_single_stem="Vocals",
                     mdx_params={
                         "hop_length": 1024,
                         "segment_size": self.mdx_segment_size,
@@ -93,10 +94,7 @@ class PythonAudioSeparatorEngine:
 
             output_files = separator.separate(
                 str(audio_path),
-                custom_output_names={
-                    "Vocals": "vocals",
-                    "Instrumental": "instrumental",
-                },
+                custom_output_names={"Vocals": "vocals"},
             )
 
         for value in output_files:

@@ -93,8 +93,6 @@ class VideoComposer:
             "44100",
             "-ac",
             "2",
-            "-af",
-            "apad",
             "-shortest",
             "-movflags",
             "+faststart",

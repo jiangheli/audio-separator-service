@@ -1,0 +1,52 @@
+name: Build Windows GUI installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Installer version
+        required: true
+        default: "1.1.0"
+  push:
+    tags:
+      - "gui-v*"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      APP_VERSION: ${{ inputs.version || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Build installer
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          .\scripts\windows\build-gui-installer.ps1 -Version $Version
+
+      - name: Verify installer
+        shell: powershell
+        run: |
+          $Installer = Get-ChildItem .\dist\installer\StemFlow-Setup-*-x64.exe |
+            Select-Object -First 1
+          if (-not $Installer -or $Installer.Length -lt 100MB) {
+            throw "Installer is missing or unexpectedly small."
+          }
+          Get-FileHash $Installer.FullName -Algorithm SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StemFlow-Windows-GUI-${{ env.APP_VERSION }}
+          path: dist/installer/StemFlow-Setup-*-x64.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
