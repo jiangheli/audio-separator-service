@@ -14,6 +14,7 @@ def test_gui_settings_round_trip(tmp_path: Path, monkeypatch) -> None:
     settings["output_dir"] = str(tmp_path / "output")
     settings["schedule_enabled"] = True
     settings["schedule_time"] = "01:30"
+    settings["worker_count"] = 3
 
     saved = gui.save_settings(settings)
     loaded = gui.load_settings()
@@ -24,6 +25,7 @@ def test_gui_settings_round_trip(tmp_path: Path, monkeypatch) -> None:
     assert config.output_dir == tmp_path / "output"
     assert loaded["schedule_enabled"] is True
     assert loaded["schedule_time"] == "01:30"
+    assert config.worker_count == 3
 
 
 def test_prepare_bundled_assets_copies_model_once(
@@ -62,3 +64,10 @@ def test_queue_log_handler_emits_compact_line() -> None:
     assert kind == "log"
     assert "INFO" in str(line)
     assert "processing video.mp4" in str(line)
+
+
+def test_memory_estimate_and_worker_recommendation() -> None:
+    assert gui.estimated_memory_gb(1) == 5.0
+    assert gui.estimated_memory_gb(4) == 14.0
+    assert gui.recommended_worker_count(16.0, 12.0, cpu_count=8) == 3
+    assert gui.recommended_worker_count(64.0, 50.0, cpu_count=16) == 8

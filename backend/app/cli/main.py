@@ -159,7 +159,10 @@ def execute(args: argparse.Namespace) -> int:
         if args.max_files < 0:
             raise ValueError("--max-files cannot be negative")
         try:
-            summary = runner.run_once(max_files=args.max_files)
+            summary = runner.run_once(
+                max_files=args.max_files,
+                max_workers=config.worker_count,
+            )
         except AlreadyRunningError:
             summary = {
                 "already_running": True,

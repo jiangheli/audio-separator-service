@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
@@ -22,6 +23,9 @@ from app.repository import ProcessingRepository
 APP_NAME = "StemFlow"
 TASK_NAME = "StemFlow-Video-BGM-Removal"
 DEFAULT_MODEL = "mdx"
+MAX_WORKERS = 8
+BASE_MEMORY_GB = 2.0
+MEMORY_PER_WORKER_GB = 3.0
 STATUS_LABELS = {
     "waiting_copy": "等待文件稳定",
     "pending": "排队中",
@@ -33,6 +37,75 @@ STATUS_LABELS = {
     "failed": "失败",
     "superseded": "源文件已更新",
 }
+
+
+def system_memory_gb() -> tuple[float, float]:
+    """Return total and currently available physical memory in GiB."""
+    try:
+        if os.name == "nt":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("length", ctypes.c_ulong),
+                    ("memory_load", ctypes.c_ulong),
+                    ("total_phys", ctypes.c_ulonglong),
+                    ("avail_phys", ctypes.c_ulonglong),
+                    ("total_page_file", ctypes.c_ulonglong),
+                    ("avail_page_file", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong),
+                    ("avail_virtual", ctypes.c_ulonglong),
+                    ("avail_extended_virtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(MemoryStatus)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                raise OSError("GlobalMemoryStatusEx failed")
+            divisor = 1024**3
+            return status.total_phys / divisor, status.avail_phys / divisor
+
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        divisor = 1024**3
+        return (
+            page_size * total_pages / divisor,
+            page_size * available_pages / divisor,
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 0.0, 0.0
+
+
+def estimated_memory_gb(worker_count: int) -> float:
+    return BASE_MEMORY_GB + max(1, worker_count) * MEMORY_PER_WORKER_GB
+
+
+def recommended_worker_count(
+    total_memory_gb: float,
+    available_memory_gb: float,
+    cpu_count: int | None = None,
+) -> int:
+    processors = max(1, cpu_count or os.cpu_count() or 1)
+    by_cpu = max(1, processors // 2)
+    if total_memory_gb <= 0 or available_memory_gb <= 0:
+        return min(MAX_WORKERS, by_cpu, 2)
+    usable = min(available_memory_gb, max(0.0, total_memory_gb - BASE_MEMORY_GB))
+    by_memory = max(1, int(max(0.0, usable - BASE_MEMORY_GB) / MEMORY_PER_WORKER_GB))
+    return max(1, min(MAX_WORKERS, by_cpu, by_memory))
+
+
+def configure_cpu_budget(worker_count: int) -> int:
+    threads_per_worker = max(1, (os.cpu_count() or 1) // max(1, worker_count))
+    value = str(threads_per_worker)
+    os.environ["OMP_NUM_THREADS"] = value
+    os.environ["MKL_NUM_THREADS"] = value
+    os.environ["OPENBLAS_NUM_THREADS"] = value
+    try:
+        import torch
+
+        torch.set_num_threads(threads_per_worker)
+    except (ImportError, RuntimeError):
+        pass
+    return threads_per_worker
 
 
 def program_data_dir() -> Path:
@@ -71,6 +144,7 @@ def default_settings() -> dict[str, Any]:
         "recursive": True,
         "keep_failed_work": False,
         "video_copy": True,
+        "worker_count": 1,
     }
 
 
@@ -198,6 +272,9 @@ class StemFlowGUI:
         self.input_var = StringVar(value=str(self.settings["input_dir"]))
         self.output_var = StringVar(value=str(self.settings["output_dir"]))
         self.model_var = StringVar(value=str(self.settings.get("model", DEFAULT_MODEL)))
+        self.worker_count = StringVar(
+            value=str(self.settings.get("worker_count", 1))
+        )
         self.schedule_enabled = BooleanVar(
             value=bool(self.settings.get("schedule_enabled", False))
         )
@@ -206,6 +283,12 @@ class StemFlowGUI:
         )
         self.status_var = StringVar(value="就绪")
         self.summary_var = StringVar(value="选择输入和输出文件夹后开始处理")
+        self.resource_var = StringVar()
+        self.total_memory_gb, self.available_memory_gb = system_memory_gb()
+        self.recommended_workers = recommended_worker_count(
+            self.total_memory_gb,
+            self.available_memory_gb,
+        )
 
         self._configure_window()
         self._build_ui()
@@ -277,8 +360,33 @@ class StemFlowGUI:
             style="Subtitle.TLabel",
         ).grid(row=2, column=1, sticky="w", padx=10, pady=(10, 0))
 
+        ttk.Label(settings, text="并发任务数").grid(
+            row=3, column=0, sticky="w", pady=(10, 0)
+        )
+        worker_frame = ttk.Frame(settings)
+        worker_frame.grid(row=3, column=1, sticky="w", padx=10, pady=(10, 0))
+        worker_picker = ttk.Combobox(
+            worker_frame,
+            textvariable=self.worker_count,
+            values=tuple(str(value) for value in range(1, MAX_WORKERS + 1)),
+            state="readonly",
+            width=6,
+        )
+        worker_picker.pack(side="left")
+        worker_picker.bind("<<ComboboxSelected>>", self._update_resource_label)
+        ttk.Button(
+            worker_frame,
+            text="使用建议值",
+            command=self._use_recommended_workers,
+        ).pack(side="left", padx=(10, 0))
+        ttk.Label(
+            settings,
+            textvariable=self.resource_var,
+            style="Subtitle.TLabel",
+        ).grid(row=4, column=1, sticky="w", padx=10, pady=(6, 0))
+
         schedule_frame = ttk.Frame(settings)
-        schedule_frame.grid(row=3, column=1, sticky="w", padx=10, pady=(10, 0))
+        schedule_frame.grid(row=5, column=1, sticky="w", padx=10, pady=(10, 0))
         ttk.Checkbutton(
             schedule_frame,
             text="每天自动运行",
@@ -294,7 +402,7 @@ class StemFlowGUI:
             settings,
             text="保存定时",
             command=self._save_schedule,
-        ).grid(row=3, column=2, pady=(10, 0))
+        ).grid(row=5, column=2, pady=(10, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=14)
@@ -359,6 +467,25 @@ class StemFlowGUI:
             font=("Consolas", 9),
         )
         self.log.pack(fill="both", expand=True)
+        self._update_resource_label()
+
+    def _use_recommended_workers(self) -> None:
+        self.worker_count.set(str(self.recommended_workers))
+        self._update_resource_label()
+
+    def _update_resource_label(self, _event: object | None = None) -> None:
+        selected = max(1, int(self.worker_count.get() or "1"))
+        estimate = estimated_memory_gb(selected)
+        if self.total_memory_gb > 0:
+            self.resource_var.set(
+                f"内存：总计 {self.total_memory_gb:.1f} GB，可用 "
+                f"{self.available_memory_gb:.1f} GB；预计需要约 {estimate:.1f} GB；"
+                f"建议 {self.recommended_workers} 个并发"
+            )
+        else:
+            self.resource_var.set(
+                f"预计需要约 {estimate:.1f} GB；建议从 1 个并发开始"
+            )
 
     def _choose_directory(self, target: StringVar) -> None:
         chosen = filedialog.askdirectory(initialdir=target.get() or str(Path.home()))
@@ -379,6 +506,7 @@ class StemFlowGUI:
                 "database_path": str(data_dir / "processing.db"),
                 "report_path": str(data_dir / "processing_status.xlsx"),
                 "model": self.model_var.get(),
+                "worker_count": int(self.worker_count.get()),
                 "schedule_enabled": self.schedule_enabled.get(),
                 "schedule_time": self.schedule_time.get().strip(),
             }
@@ -417,6 +545,19 @@ class StemFlowGUI:
         except Exception as error:
             messagebox.showerror("配置错误", str(error))
             return
+        self.total_memory_gb, self.available_memory_gb = system_memory_gb()
+        required_memory = estimated_memory_gb(config.worker_count)
+        if (
+            self.available_memory_gb > 0
+            and required_memory > self.available_memory_gb
+            and not messagebox.askyesno(
+                "内存可能不足",
+                f"{config.worker_count} 个并发预计需要约 {required_memory:.1f} GB，"
+                f"当前可用内存约 {self.available_memory_gb:.1f} GB。\n\n"
+                "内存不足可能导致处理失败，仍然继续吗？",
+            )
+        ):
+            return
 
         self.stop_requested.clear()
         self.start_button.configure(state="disabled")
@@ -432,23 +573,27 @@ class StemFlowGUI:
 
     def _run_batches(self, config: ServiceConfig) -> None:
         try:
-            runner, repository, logger = make_runner(config)
+            runner, _repository, logger = make_runner(config)
             handler = QueueLogHandler(self.events)
             logger.addHandler(handler)
-            while not self.stop_requested.is_set():
-                summary = runner.run_once(max_files=1)
-                self.events.put(("refresh", None))
-                if int(summary.get("queued", 0)) == 0:
-                    break
-                if not repository.eligible(config.max_retries):
-                    break
+            threads_per_worker = configure_cpu_budget(config.worker_count)
+            logger.info(
+                "Starting %s concurrent job(s), %s CPU thread(s) per worker",
+                config.worker_count,
+                threads_per_worker,
+            )
+            runner.run_once(
+                max_workers=config.worker_count,
+                stop_event=self.stop_requested,
+            )
+            self.events.put(("refresh", None))
             self.events.put(("done", None))
         except Exception as error:
             self.events.put(("error", f"{type(error).__name__}: {error}"))
 
     def _request_stop(self) -> None:
         self.stop_requested.set()
-        self.status_var.set("将在当前视频完成后停止")
+        self.status_var.set("将在当前并发任务完成后停止")
         self.stop_button.configure(state="disabled")
 
     def _drain_events(self) -> None:
@@ -535,7 +680,8 @@ def run_scheduled() -> int:
         prepare_bundled_assets(settings)
         config = service_config(settings)
         runner, _repository, _logger = make_runner(config)
-        runner.run_once()
+        configure_cpu_budget(config.worker_count)
+        runner.run_once(max_workers=config.worker_count)
         return 0
     except Exception:
         logging.exception("Scheduled StemFlow run failed")

@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -78,3 +80,69 @@ def test_runner_processes_each_video_once_and_writes_report(tmp_path: Path) -> N
     record = repository.list_jobs()[0]
     assert record["status"] == "completed"
     assert record["output_path"] == str(output)
+
+
+def test_runner_processes_jobs_with_selected_worker_count(tmp_path: Path) -> None:
+    class ConcurrentPipeline(FakePipeline):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def process(self, *args: object, **kwargs: object) -> VideoProcessResult:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.05)
+                return super().process(*args, **kwargs)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    config = make_config(tmp_path)
+    config.prepare_directories()
+    for index in range(4):
+        (config.input_dir / f"episode-{index}.mp4").write_bytes(b"video")
+    repository = ProcessingRepository(config.database_path)
+    pipeline = ConcurrentPipeline()
+    runner = BatchRunner(
+        config,
+        repository,
+        pipeline,
+        ProcessingReport(config.report_path),
+        logging.getLogger("test-concurrent-runner"),
+    )
+
+    summary = runner.run_once(max_workers=3)
+
+    assert summary["completed"] == 4
+    assert summary["failed"] == 0
+    assert pipeline.max_active == 3
+    assert len(list(config.output_dir.glob("*_vocals_only.mp4"))) == 4
+
+
+def test_runner_leaves_unclaimed_jobs_pending_after_stop(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.prepare_directories()
+    for index in range(3):
+        (config.input_dir / f"episode-{index}.mp4").write_bytes(b"video")
+    repository = ProcessingRepository(config.database_path)
+    pipeline = FakePipeline()
+    runner = BatchRunner(
+        config,
+        repository,
+        pipeline,
+        ProcessingReport(config.report_path),
+        logging.getLogger("test-stop-runner"),
+    )
+    stop_event = threading.Event()
+    stop_event.set()
+
+    summary = runner.run_once(max_workers=3, stop_event=stop_event)
+
+    assert summary["completed"] == 0
+    assert summary["failed"] == 0
+    assert pipeline.calls == 0
+    assert repository.counts()["pending"] == 3

@@ -41,8 +41,7 @@ class PythonAudioSeparatorEngine:
         self.mdx_segment_size = mdx_segment_size
         self.mdxc_segment_size = mdxc_segment_size
         self.log_level = log_level
-        self._separators: dict[str, object] = {}
-        self._lock = threading.Lock()
+        self._thread_local = threading.local()
 
     def resolve_model(self, model: str) -> str:
         normalized = model.strip().lower()
@@ -58,44 +57,47 @@ class PythonAudioSeparatorEngine:
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
         model_filename = self.resolve_model(model)
-        with self._lock:
-            separator = self._separators.get(model_filename)
-            if separator is None:
-                from audio_separator.separator import Separator
+        separators = getattr(self._thread_local, "separators", None)
+        if separators is None:
+            separators = {}
+            self._thread_local.separators = separators
+        separator = separators.get(model_filename)
+        if separator is None:
+            from audio_separator.separator import Separator
 
-                separator = Separator(
-                    log_level=self.log_level,
-                    model_file_dir=str(self.model_dir),
-                    output_dir=str(output_dir),
-                    output_format="WAV",
-                    output_single_stem="Vocals",
-                    mdx_params={
-                        "hop_length": 1024,
-                        "segment_size": self.mdx_segment_size,
-                        "overlap": 0.25,
-                        "batch_size": 1,
-                        "enable_denoise": False,
-                    },
-                    mdxc_params={
-                        "segment_size": self.mdxc_segment_size,
-                        "override_model_segment_size": True,
-                        "batch_size": 1,
-                        "overlap": 8,
-                        "pitch_shift": 0,
-                    },
-                )
-                separator.load_model(model_filename=model_filename)
-                self._separators[model_filename] = separator
-            else:
-                separator.output_dir = str(output_dir)
-                model_instance = getattr(separator, "model_instance", None)
-                if model_instance is not None:
-                    model_instance.output_dir = str(output_dir)
-
-            output_files = separator.separate(
-                str(audio_path),
-                custom_output_names={"Vocals": "vocals"},
+            separator = Separator(
+                log_level=self.log_level,
+                model_file_dir=str(self.model_dir),
+                output_dir=str(output_dir),
+                output_format="WAV",
+                output_single_stem="Vocals",
+                mdx_params={
+                    "hop_length": 1024,
+                    "segment_size": self.mdx_segment_size,
+                    "overlap": 0.25,
+                    "batch_size": 1,
+                    "enable_denoise": False,
+                },
+                mdxc_params={
+                    "segment_size": self.mdxc_segment_size,
+                    "override_model_segment_size": True,
+                    "batch_size": 1,
+                    "overlap": 8,
+                    "pitch_shift": 0,
+                },
             )
+            separator.load_model(model_filename=model_filename)
+            separators[model_filename] = separator
+        else:
+            separator.output_dir = str(output_dir)
+            model_instance = getattr(separator, "model_instance", None)
+            if model_instance is not None:
+                model_instance.output_dir = str(output_dir)
+
+        output_files = separator.separate(
+            str(audio_path),
+            custom_output_names={"Vocals": "vocals"},
+        )
 
         for value in output_files:
             path = Path(value)

@@ -39,6 +39,7 @@ class ServiceConfig:
     recursive: bool = True
     keep_failed_work: bool = False
     video_copy: bool = True
+    worker_count: int = 1
 
     @classmethod
     def load(cls, config_path: str | Path) -> "ServiceConfig":
@@ -85,6 +86,7 @@ class ServiceConfig:
             recursive=bool(raw.get("recursive", True)),
             keep_failed_work=bool(raw.get("keep_failed_work", False)),
             video_copy=bool(raw.get("video_copy", True)),
+            worker_count=int(raw.get("worker_count", 1)),
         )
         config.validate()
         return config
@@ -96,6 +98,8 @@ class ServiceConfig:
             raise ValueError("stable_seconds must be between 0 and 86400")
         if self.max_retries < 0 or self.max_retries > 20:
             raise ValueError("max_retries must be between 0 and 20")
+        if self.worker_count < 1 or self.worker_count > 8:
+            raise ValueError("worker_count must be between 1 and 8")
         if not self.output_suffix or any(char in self.output_suffix for char in '<>:"/\\|?*'):
             raise ValueError("output_suffix contains invalid filename characters")
         if not re.fullmatch(r"\d{2,4}k", self.audio_bitrate):
