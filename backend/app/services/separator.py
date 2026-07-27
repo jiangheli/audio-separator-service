@@ -105,6 +105,13 @@ class PythonAudioSeparatorEngine:
                 path = output_dir / path
             if "vocal" in path.stem.lower() and path.is_file():
                 return path.resolve()
+        written_files = sorted(
+            str(path.relative_to(output_dir))
+            for path in output_dir.rglob("*")
+            if path.is_file()
+        )
         raise VocalSeparationError(
-            f"The model completed but did not produce a vocals stem for {audio_path.name}"
+            f"The model completed but did not produce a vocals stem for "
+            f"{audio_path.name}; returned={output_files!r}; "
+            f"written_files={written_files!r}"
         )

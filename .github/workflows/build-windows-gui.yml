@@ -6,7 +6,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.2.3"
+        default: "1.2.4"
   push:
     tags:
       - "gui-v*"
@@ -46,9 +46,18 @@ jobs:
 
           $Ffmpeg = python -c `
             "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          $SpeechWav = Join-Path $SmokeRoot "speech.wav"
+          Add-Type -AssemblyName System.Speech
+          $Synthesizer = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $Synthesizer.SetOutputToWaveFile($SpeechWav)
+          $Synthesizer.Speak(
+            "Stem Flow removes background music and keeps the spoken voice. " +
+            "This sentence verifies the packaged Windows inference engine."
+          )
+          $Synthesizer.Dispose()
           & $Ffmpeg -hide_banner -loglevel error -y `
-            -f lavfi -i "color=c=black:s=320x240:r=25:d=1" `
-            -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=1" `
+            -f lavfi -i "color=c=black:s=320x240:r=25:d=8" `
+            -i $SpeechWav `
             -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest `
             (Join-Path $InputDir "smoke.mp4")
 
