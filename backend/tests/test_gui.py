@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 from pathlib import Path
 
 from app import gui
@@ -71,3 +72,15 @@ def test_memory_estimate_and_worker_recommendation() -> None:
     assert gui.estimated_memory_gb(4) == 14.0
     assert gui.recommended_worker_count(16.0, 12.0, cpu_count=8) == 3
     assert gui.recommended_worker_count(64.0, 50.0, cpu_count=16) == 8
+
+
+def test_windowed_runtime_gets_standard_stream_sinks(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+
+    gui.ensure_standard_streams()
+
+    assert sys.stdout is not None
+    assert sys.stderr is not None
+    sys.stdout.close()
+    sys.stderr.close()

@@ -108,6 +108,17 @@ def configure_cpu_budget(worker_count: int) -> int:
     return threads_per_worker
 
 
+def ensure_standard_streams() -> None:
+    """Give console-oriented libraries a valid sink in a windowed executable."""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(
+                sys,
+                name,
+                open(os.devnull, "w", encoding="utf-8"),
+            )
+
+
 def program_data_dir() -> Path:
     root = os.environ.get("PROGRAMDATA") or os.environ.get("LOCALAPPDATA")
     if root:
@@ -689,6 +700,7 @@ def run_scheduled() -> int:
 
 
 def main() -> int:
+    ensure_standard_streams()
     if "--run-scheduled" in sys.argv:
         return run_scheduled()
     root = Tk()

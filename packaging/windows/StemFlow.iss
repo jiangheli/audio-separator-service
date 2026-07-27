@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "1.2.5"
+  #define AppVersion "1.2.6"
 #endif
 
 #define AppName "StemFlow 视频纯人声工具"
