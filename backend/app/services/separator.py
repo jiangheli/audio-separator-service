@@ -71,6 +71,7 @@ class PythonAudioSeparatorEngine:
                 output_dir=str(output_dir),
                 output_format="WAV",
                 output_single_stem="Vocals",
+                use_soundfile=True,
                 mdx_params={
                     "hop_length": 1024,
                     "segment_size": self.mdx_segment_size,

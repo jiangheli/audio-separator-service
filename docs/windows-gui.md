@@ -83,13 +83,13 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.2.4"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.2.5"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.2.4-x64.exe
+dist\installer\StemFlow-Setup-1.2.5-x64.exe
 ```
 
 也可以手动触发 GitHub Actions 的 `Build Windows GUI installer` 工作流。

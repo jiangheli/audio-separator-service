@@ -31,4 +31,11 @@ def configure_logging(log_dir: Path, *, verbose: bool = False) -> logging.Logger
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+    upstream_logger = logging.getLogger("audio_separator")
+    upstream_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    upstream_logger.handlers.clear()
+    for handler in logger.handlers:
+        upstream_logger.addHandler(handler)
+    upstream_logger.propagate = False
     return logger
