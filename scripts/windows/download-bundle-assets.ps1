@@ -57,6 +57,10 @@ Get-Asset `
     -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" `
     -Output (Join-Path $Destination "vc_redist.x64.exe") `
     -MinimumBytes 10000000
+Get-Asset `
+    -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" `
+    -Output (Join-Path $Destination "ChineseSimplified.isl") `
+    -MinimumBytes 15000
 
 $Signature = Get-AuthenticodeSignature (Join-Path $Destination "vc_redist.x64.exe")
 if ($Signature.Status -ne "Valid") {
