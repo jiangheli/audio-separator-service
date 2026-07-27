@@ -6,7 +6,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.2.2"
+        default: "1.2.3"
   push:
     tags:
       - "gui-v*"
@@ -44,7 +44,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $InputDir, $OutputDir, $DataDir |
             Out-Null
 
-          ffmpeg -hide_banner -loglevel error -y `
+          $Ffmpeg = python -c `
+            "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          & $Ffmpeg -hide_banner -loglevel error -y `
             -f lavfi -i "color=c=black:s=320x240:r=25:d=1" `
             -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=1" `
             -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest `
@@ -83,8 +85,7 @@ jobs:
               -ErrorAction SilentlyContinue
             throw "Packaged StemFlow did not create a valid vocals-only video."
           }
-          ffprobe -v error -show_entries format=duration,size `
-            -of default=noprint_wrappers=1 $Output
+          & $Ffmpeg -hide_banner -loglevel error -i $Output -f null NUL
 
       - name: Verify installer
         shell: powershell
