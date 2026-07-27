@@ -6,7 +6,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.2.1"
+        default: "1.2.2"
   push:
     tags:
       - "gui-v*"
@@ -32,6 +32,59 @@ jobs:
         run: |
           $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
           .\scripts\windows\build-gui-installer.ps1 -Version $Version
+
+      - name: Smoke test packaged inference
+        shell: powershell
+        run: |
+          $SmokeRoot = Join-Path $env:RUNNER_TEMP "stemflow-smoke"
+          $InputDir = Join-Path $SmokeRoot "input"
+          $OutputDir = Join-Path $SmokeRoot "output"
+          $env:PROGRAMDATA = Join-Path $SmokeRoot "programdata"
+          $DataDir = Join-Path $env:PROGRAMDATA "StemFlow"
+          New-Item -ItemType Directory -Force -Path $InputDir, $OutputDir, $DataDir |
+            Out-Null
+
+          ffmpeg -hide_banner -loglevel error -y `
+            -f lavfi -i "color=c=black:s=320x240:r=25:d=1" `
+            -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=1" `
+            -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest `
+            (Join-Path $InputDir "smoke.mp4")
+
+          @{
+            input_dir = $InputDir
+            output_dir = $OutputDir
+            data_dir = $DataDir
+            model_dir = (Join-Path $DataDir "models")
+            work_dir = (Join-Path $DataDir "work")
+            log_dir = (Join-Path $DataDir "logs")
+            database_path = (Join-Path $DataDir "processing.db")
+            report_path = (Join-Path $DataDir "processing_status.xlsx")
+            model = "mdx"
+            stable_seconds = 0
+            worker_count = 1
+            schedule_time = "00:00"
+          } | ConvertTo-Json | Set-Content `
+            -Path (Join-Path $DataDir "config.json") `
+            -Encoding UTF8
+
+          $Process = Start-Process `
+            -FilePath ".\dist\StemFlow\StemFlow.exe" `
+            -ArgumentList "--run-scheduled" `
+            -Wait `
+            -PassThru
+          if ($Process.ExitCode -ne 0) {
+            Get-Content (Join-Path $DataDir "logs\stemflow-video.log") `
+              -ErrorAction SilentlyContinue
+            throw "Packaged StemFlow smoke test exited with $($Process.ExitCode)."
+          }
+          $Output = Join-Path $OutputDir "smoke_vocals_only.mp4"
+          if (-not (Test-Path $Output) -or (Get-Item $Output).Length -lt 1000) {
+            Get-Content (Join-Path $DataDir "logs\stemflow-video.log") `
+              -ErrorAction SilentlyContinue
+            throw "Packaged StemFlow did not create a valid vocals-only video."
+          }
+          ffprobe -v error -show_entries format=duration,size `
+            -of default=noprint_wrappers=1 $Output
 
       - name: Verify installer
         shell: powershell
