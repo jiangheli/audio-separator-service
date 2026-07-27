@@ -11,7 +11,9 @@ if ([string]::IsNullOrWhiteSpace($Destination)) {
     $Destination = Join-Path $ProjectRoot "packaging\windows\bundle"
 }
 $ModelDirectory = Join-Path $Destination "models"
-New-Item -ItemType Directory -Force -Path $ModelDirectory | Out-Null
+$GpuBootstrapDirectory = Join-Path $Destination "gpu-bootstrap"
+New-Item -ItemType Directory -Force `
+    -Path $ModelDirectory, $GpuBootstrapDirectory | Out-Null
 
 function Get-Asset {
     param(
@@ -61,6 +63,21 @@ Get-Asset `
     -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" `
     -Output (Join-Path $Destination "ChineseSimplified.isl") `
     -MinimumBytes 15000
+Get-Asset `
+    -Uri "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip" `
+    -Output (Join-Path $GpuBootstrapDirectory "python-3.12.10-embed-amd64.zip") `
+    -MinimumBytes 10000000
+Get-Asset `
+    -Uri "https://bootstrap.pypa.io/get-pip.py" `
+    -Output (Join-Path $GpuBootstrapDirectory "get-pip.py") `
+    -MinimumBytes 1000000
+
+$PythonArchive = Join-Path $GpuBootstrapDirectory "python-3.12.10-embed-amd64.zip"
+$ExpectedPythonSha256 = "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3"
+$ActualPythonSha256 = (Get-FileHash $PythonArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($ActualPythonSha256 -ne $ExpectedPythonSha256) {
+    throw "Embedded Python SHA256 mismatch: $ActualPythonSha256"
+}
 
 $Signature = Get-AuthenticodeSignature (Join-Path $Destination "vc_redist.x64.exe")
 if ($Signature.Status -ne "Valid") {

@@ -45,6 +45,15 @@ if not (models_dir / "UVR-MDX-NET-Inst_HQ_3.onnx").is_file():
     )
 datas.append((str(models_dir), "models"))
 
+gpu_bootstrap_dir = bundle_root / "gpu-bootstrap"
+if not (gpu_bootstrap_dir / "python-3.12.10-embed-amd64.zip").is_file():
+    raise SystemExit(
+        "GPU bootstrap assets are missing. Run "
+        "scripts/windows/download-bundle-assets.ps1 first."
+    )
+datas.append((str(gpu_bootstrap_dir), "gpu-bootstrap"))
+datas.append((str(backend_root / "app"), "gpu-bootstrap/stemflow/app"))
+
 a = Analysis(
     [str(backend_root / "app" / "gui.py")],
     pathex=[str(backend_root)],

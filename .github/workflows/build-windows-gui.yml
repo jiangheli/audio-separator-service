@@ -6,7 +6,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.2.6"
+        default: "1.3.0"
   push:
     tags:
       - "gui-v*"
@@ -95,6 +95,25 @@ jobs:
             throw "Packaged StemFlow did not create a valid vocals-only video."
           }
           & $Ffmpeg -hide_banner -loglevel error -i $Output -f null NUL
+
+      - name: Verify CUDA bootstrap assets
+        shell: powershell
+        run: |
+          $PythonBootstrap = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "python-3.12.10-embed-amd64.zip" |
+            Select-Object -First 1
+          $GetPip = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "get-pip.py" |
+            Select-Object -First 1
+          $GpuWorker = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "gpu_worker.py" |
+            Select-Object -First 1
+          if (-not $PythonBootstrap -or $PythonBootstrap.Length -lt 10MB) {
+            throw "Embedded Python CUDA bootstrap is missing."
+          }
+          if (-not $GetPip -or -not $GpuWorker) {
+            throw "CUDA installer or worker source is missing."
+          }
 
       - name: Verify installer
         shell: powershell

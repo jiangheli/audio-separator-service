@@ -41,6 +41,7 @@ class PythonAudioSeparatorEngine:
         self.mdx_segment_size = mdx_segment_size
         self.mdxc_segment_size = mdxc_segment_size
         self.log_level = log_level
+        self.logger = logging.getLogger("stemflow_video")
         self._thread_local = threading.local()
 
     def resolve_model(self, model: str) -> str:
@@ -54,14 +55,20 @@ class PythonAudioSeparatorEngine:
         audio_path: Path,
         output_dir: Path,
         model: str,
+        *,
+        device: str = "auto",
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
         model_filename = self.resolve_model(model)
+        selected_device = device.strip().lower()
+        if selected_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError(f"Unsupported inference device: {device}")
         separators = getattr(self._thread_local, "separators", None)
         if separators is None:
             separators = {}
             self._thread_local.separators = separators
-        separator = separators.get(model_filename)
+        cache_key = (model_filename, selected_device)
+        separator = separators.get(cache_key)
         if separator is None:
             from audio_separator.separator import Separator
 
@@ -87,8 +94,9 @@ class PythonAudioSeparatorEngine:
                     "pitch_shift": 0,
                 },
             )
+            self._select_device(separator, selected_device)
             separator.load_model(model_filename=model_filename)
-            separators[model_filename] = separator
+            separators[cache_key] = separator
         else:
             separator.output_dir = str(output_dir)
             model_instance = getattr(separator, "model_instance", None)
@@ -115,4 +123,36 @@ class PythonAudioSeparatorEngine:
             f"The model completed but did not produce a vocals stem for "
             f"{audio_path.name}; returned={output_files!r}; "
             f"written_files={written_files!r}"
+        )
+
+    def _select_device(self, separator: object, device: str) -> None:
+        """Select a public runtime device without changing upstream inference."""
+        if device == "auto":
+            return
+        import onnxruntime as ort
+        import torch
+
+        if device == "cpu":
+            cpu = torch.device("cpu")
+            separator.torch_device = cpu
+            separator.torch_device_cpu = cpu
+            separator.onnx_execution_provider = ["CPUExecutionProvider"]
+            self.logger.info("Inference device selected: CPU")
+            return
+
+        providers = ort.get_available_providers()
+        if not torch.cuda.is_available():
+            raise VocalSeparationError(
+                "NVIDIA CUDA was selected, but CUDA PyTorch is unavailable"
+            )
+        if "CUDAExecutionProvider" not in providers:
+            raise VocalSeparationError(
+                "NVIDIA CUDA was selected, but ONNX Runtime CUDAExecutionProvider "
+                "is unavailable"
+            )
+        separator.torch_device = torch.device("cuda")
+        separator.onnx_execution_provider = ["CUDAExecutionProvider"]
+        self.logger.info(
+            "Inference device selected: CUDA (%s)",
+            torch.cuda.get_device_name(0),
         )

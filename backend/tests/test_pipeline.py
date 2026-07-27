@@ -13,7 +13,15 @@ class FakeExtractor:
 
 
 class FakeSeparator:
-    def separate_vocals(self, _audio: Path, output_dir: Path, _model: str) -> Path:
+    def separate_vocals(
+        self,
+        _audio: Path,
+        output_dir: Path,
+        _model: str,
+        *,
+        device: str = "auto",
+    ) -> Path:
+        assert device in {"auto", "cpu", "cuda"}
         output_dir.mkdir(parents=True, exist_ok=True)
         vocals = output_dir / "vocals.wav"
         vocals.write_bytes(b"vocals")

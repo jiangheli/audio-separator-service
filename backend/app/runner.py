@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,49 @@ from app.services.scanner import (
     scan_videos,
 )
 from app.services.video_pipeline import VideoBgmRemovalPipeline
+
+
+class ConcurrencyController:
+    """Thread-safe CPU/GPU worker allocation that can change during a batch."""
+
+    def __init__(self, initial: int, *, maximum: int = 8) -> None:
+        if maximum < 1:
+            raise ValueError("maximum must be at least 1")
+        self.maximum = maximum
+        self._cpu_workers = 1
+        self._gpu_workers = 0
+        self._lock = threading.Lock()
+        self.set(initial)
+
+    def get(self) -> int:
+        with self._lock:
+            return self._cpu_workers + self._gpu_workers
+
+    def get_allocation(self) -> tuple[int, int]:
+        with self._lock:
+            return self._cpu_workers, self._gpu_workers
+
+    def set(self, value: int) -> int:
+        selected = self.set_allocation(cpu_workers=value, gpu_workers=0)
+        return sum(selected)
+
+    def set_allocation(
+        self,
+        *,
+        cpu_workers: int,
+        gpu_workers: int,
+    ) -> tuple[int, int]:
+        cpu = int(cpu_workers)
+        gpu = int(gpu_workers)
+        total = cpu + gpu
+        if cpu < 0 or gpu < 0 or total < 1 or total > self.maximum:
+            raise ValueError(
+                f"combined concurrency must be between 1 and {self.maximum}"
+            )
+        with self._lock:
+            self._cpu_workers = cpu
+            self._gpu_workers = gpu
+        return cpu, gpu
 
 
 class BatchRunner:
@@ -42,9 +85,15 @@ class BatchRunner:
         max_files: int = 0,
         max_workers: int = 1,
         stop_event: threading.Event | None = None,
+        concurrency: ConcurrencyController | None = None,
     ) -> dict[str, Any]:
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1")
+        route_devices = concurrency is not None
+        controller = concurrency or ConcurrencyController(
+            max_workers,
+            maximum=max_workers,
+        )
         self.config.prepare_directories()
         lock_path = self.config.data_dir / "stemflow-video.lock"
         with ProcessLock(lock_path):
@@ -120,29 +169,12 @@ class BatchRunner:
             )
 
             self._refresh_report()
-            if max_workers == 1:
-                outcomes = [
-                    self._claim_and_process(job, stop_event)
-                    for job in jobs
-                ]
-            else:
-                worker_count = min(max_workers, len(jobs))
-                outcomes = []
-                if worker_count:
-                    with ThreadPoolExecutor(
-                        max_workers=worker_count,
-                        thread_name_prefix="stemflow-worker",
-                    ) as executor:
-                        futures = {
-                            executor.submit(
-                                self._claim_and_process,
-                                job,
-                                stop_event,
-                            ): job
-                            for job in jobs
-                        }
-                        for future in as_completed(futures):
-                            outcomes.append(future.result())
+            outcomes = self._run_jobs(
+                jobs,
+                controller=controller,
+                stop_event=stop_event,
+                route_devices=route_devices,
+            )
 
             summary["completed"] = outcomes.count("completed")
             summary["failed"] = outcomes.count("failed")
@@ -155,25 +187,92 @@ class BatchRunner:
             )
             return summary
 
+    def _run_jobs(
+        self,
+        jobs: list[dict[str, Any]],
+        *,
+        controller: ConcurrencyController,
+        stop_event: threading.Event | None,
+        route_devices: bool,
+    ) -> list[str]:
+        """Run jobs while honoring live increases and decreases in concurrency."""
+        if not jobs:
+            return []
+        outcomes: list[str] = []
+        next_job = 0
+        active: dict[Future[str], str] = {}
+        with ThreadPoolExecutor(
+            max_workers=controller.maximum,
+            thread_name_prefix="stemflow-worker",
+        ) as executor:
+            while next_job < len(jobs) or active:
+                stopping = stop_event is not None and stop_event.is_set()
+                cpu_target, gpu_target = controller.get_allocation()
+                active_cpu = sum(device == "cpu" for device in active.values())
+                active_gpu = sum(device == "cuda" for device in active.values())
+                for device, target, current in (
+                    ("cuda", gpu_target, active_gpu),
+                    ("cpu", cpu_target, active_cpu),
+                ):
+                    while (
+                        not stopping
+                        and next_job < len(jobs)
+                        and current < target
+                    ):
+                        future = executor.submit(
+                            self._claim_and_process,
+                            jobs[next_job],
+                            stop_event,
+                            device if route_devices else None,
+                        )
+                        active[future] = device
+                        next_job += 1
+                        current += 1
+
+                if not active:
+                    break
+
+                finished, _pending = wait(
+                    set(active),
+                    timeout=0.25,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in finished:
+                    outcomes.append(future.result())
+                    active.pop(future, None)
+        return outcomes
+
     def _claim_and_process(
         self,
         job: dict[str, Any],
         stop_event: threading.Event | None,
+        device: str | None = None,
     ) -> str:
         if stop_event is not None and stop_event.is_set():
             return "skipped"
         claimed = self.repository.claim(job["id"], self.config.max_retries)
         if claimed is None:
             return "skipped"
-        return self._process_claimed(claimed)
+        return self._process_claimed(claimed, device=device)
 
-    def _process_claimed(self, claimed: dict[str, Any]) -> str:
+    def _process_claimed(
+        self,
+        claimed: dict[str, Any],
+        *,
+        device: str | None = None,
+    ) -> str:
         started = time.monotonic()
         source = Path(claimed["source_path"])
         output = Path(claimed["output_path"])
+        if device is not None:
+            claimed = self.repository.update(
+                claimed["id"],
+                device=device,
+            )
         self.logger.info(
-            "Processing %s (attempt %s/%s)",
+            "Processing %s on %s (attempt %s/%s)",
             claimed["relative_path"],
+            (device or "auto").upper(),
             claimed["attempts"],
             self.config.max_retries + 1,
         )
@@ -184,14 +283,15 @@ class BatchRunner:
             self._refresh_report()
 
         try:
-            result = self.pipeline.process(
-                source,
-                output,
-                job_id=claimed["id"],
-                model=claimed["model"],
-                prefer_video_copy=self.config.video_copy,
-                progress=progress,
-            )
+            process_options = {
+                "job_id": claimed["id"],
+                "model": claimed["model"],
+                "prefer_video_copy": self.config.video_copy,
+                "progress": progress,
+            }
+            if device is not None:
+                process_options["device"] = device
+            result = self.pipeline.process(source, output, **process_options)
             self.repository.update(
                 claimed["id"],
                 status="completed",

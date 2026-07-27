@@ -8,12 +8,13 @@ from app.config import ServiceConfig
 from app.models import VideoProcessResult
 from app.report import ProcessingReport
 from app.repository import ProcessingRepository
-from app.runner import BatchRunner
+from app.runner import BatchRunner, ConcurrencyController
 
 
 class FakePipeline:
     def __init__(self) -> None:
         self.calls = 0
+        self.devices: list[str] = []
 
     def process(
         self,
@@ -24,8 +25,11 @@ class FakePipeline:
         model: str,
         prefer_video_copy: bool,
         progress: object,
+        device: str = "auto",
     ) -> VideoProcessResult:
+        assert device in {"auto", "cpu", "cuda"}
         self.calls += 1
+        self.devices.append(device)
         progress("extracting_audio", "extracting")
         progress("separating_vocals", "separating")
         progress("composing_video", "composing")
@@ -146,3 +150,96 @@ def test_runner_leaves_unclaimed_jobs_pending_after_stop(tmp_path: Path) -> None
     assert summary["failed"] == 0
     assert pipeline.calls == 0
     assert repository.counts()["pending"] == 3
+
+
+def test_runner_applies_live_concurrency_increase(tmp_path: Path) -> None:
+    first_started = threading.Event()
+    allow_first_to_finish = threading.Event()
+
+    class AdjustablePipeline(FakePipeline):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def process(self, *args: object, **kwargs: object) -> VideoProcessResult:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                if self.calls == 0:
+                    first_started.set()
+            if self.calls == 0:
+                allow_first_to_finish.wait(timeout=2)
+            try:
+                time.sleep(0.05)
+                return super().process(*args, **kwargs)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    config = make_config(tmp_path)
+    config.prepare_directories()
+    for index in range(4):
+        (config.input_dir / f"episode-{index}.mp4").write_bytes(b"video")
+    repository = ProcessingRepository(config.database_path)
+    pipeline = AdjustablePipeline()
+    runner = BatchRunner(
+        config,
+        repository,
+        pipeline,
+        ProcessingReport(config.report_path),
+        logging.getLogger("test-adjustable-runner"),
+    )
+    controller = ConcurrencyController(1, maximum=4)
+    result: dict[str, object] = {}
+
+    thread = threading.Thread(
+        target=lambda: result.update(
+            runner.run_once(
+                max_workers=1,
+                concurrency=controller,
+            )
+        )
+    )
+    thread.start()
+    assert first_started.wait(timeout=2)
+    controller.set(3)
+    time.sleep(0.35)
+    allow_first_to_finish.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert result["completed"] == 4
+    assert pipeline.max_active >= 2
+
+
+def test_runner_routes_and_records_mixed_cpu_cuda_jobs(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.prepare_directories()
+    for index in range(4):
+        (config.input_dir / f"mixed-{index}.mp4").write_bytes(b"video")
+    repository = ProcessingRepository(config.database_path)
+    pipeline = FakePipeline()
+    runner = BatchRunner(
+        config,
+        repository,
+        pipeline,
+        ProcessingReport(config.report_path),
+        logging.getLogger("test-mixed-runner"),
+    )
+    controller = ConcurrencyController(1, maximum=4)
+    controller.set_allocation(cpu_workers=1, gpu_workers=1)
+
+    summary = runner.run_once(
+        max_workers=2,
+        concurrency=controller,
+    )
+
+    assert summary["completed"] == 4
+    assert {"cpu", "cuda"}.issubset(set(pipeline.devices))
+    recorded_devices = {
+        str(job["device"])
+        for job in repository.list_jobs()
+    }
+    assert recorded_devices == {"cpu", "cuda"}

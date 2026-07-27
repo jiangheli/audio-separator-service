@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from app.config import ServiceConfig
+from app.gpu_runtime import (
+    cuda_runtime_available,
+    runtime_python,
+    runtime_ready,
+)
 from app.logging_setup import configure_logging
 from app.process_lock import AlreadyRunningError
 from app.report import ProcessingReport
@@ -18,6 +23,7 @@ from app.runner import BatchRunner
 from app.runtime import RuntimeDependencyError, ensure_ffmpeg
 from app.services.composer import VideoComposer
 from app.services.extractor import AudioExtractor
+from app.services.hybrid_pipeline import HybridVideoPipeline
 from app.services.separator import PythonAudioSeparatorEngine
 from app.services.video_pipeline import VideoBgmRemovalPipeline
 
@@ -89,12 +95,26 @@ def make_runner(
         default_model=config.model,
         log_level=logging.DEBUG if verbose else logging.INFO,
     )
-    pipeline = VideoBgmRemovalPipeline(
+    local_pipeline = VideoBgmRemovalPipeline(
         AudioExtractor(ffmpeg),
         separator,
         VideoComposer(ffmpeg, audio_bitrate=config.audio_bitrate),
         work_root=config.work_dir,
         keep_failed_work=config.keep_failed_work,
+    )
+    cuda_python = (
+        runtime_python()
+        if runtime_ready() and cuda_runtime_available()
+        else None
+    )
+    pipeline = HybridVideoPipeline(
+        local_pipeline,
+        cuda_python=cuda_python,
+        model_dir=config.model_dir,
+        work_root=config.work_dir,
+        audio_bitrate=config.audio_bitrate,
+        keep_failed_work=config.keep_failed_work,
+        logger=logger,
     )
     report = ProcessingReport(config.report_path)
     return BatchRunner(config, repository, pipeline, report, logger), repository, logger

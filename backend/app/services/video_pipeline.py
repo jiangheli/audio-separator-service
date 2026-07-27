@@ -39,6 +39,7 @@ class VideoBgmRemovalPipeline:
         model: str,
         prefer_video_copy: bool,
         progress: ProgressCallback | None = None,
+        device: str = "auto",
     ) -> VideoProcessResult:
         started = time.monotonic()
         job_work_dir = self.work_root / job_id
@@ -53,7 +54,12 @@ class VideoBgmRemovalPipeline:
 
             if progress:
                 progress("separating_vocals", f"Separating vocals from {source_video.name}")
-            vocals = self.separator.separate_vocals(source_audio, separation_dir, model)
+            vocals = self.separator.separate_vocals(
+                source_audio,
+                separation_dir,
+                model,
+                device=device,
+            )
 
             if progress:
                 progress("composing_video", f"Composing vocals-only video for {source_video.name}")

@@ -29,7 +29,9 @@ def ensure_ffmpeg() -> str:
     # imageio-ffmpeg uses versioned filenames such as
     # `ffmpeg-macos-aarch64-v7.1`. python-audio-separator checks for the
     # literal command `ffmpeg`, so expose a stable shim name on PATH.
-    shim_dir = Path(tempfile.gettempdir()) / "stemflow-ffmpeg-bin"
+    # A per-process shim avoids races when CPU and CUDA worker processes start
+    # at the same time.
+    shim_dir = Path(tempfile.gettempdir()) / f"stemflow-ffmpeg-bin-{os.getpid()}"
     shim_dir.mkdir(parents=True, exist_ok=True)
     shim = shim_dir / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
     if not shim.exists() or shim.resolve() != bundled_ffmpeg:
@@ -38,7 +40,10 @@ def ensure_ffmpeg() -> str:
         try:
             shim.symlink_to(bundled_ffmpeg)
         except OSError:
-            shutil.copy2(bundled_ffmpeg, shim)
+            try:
+                os.link(bundled_ffmpeg, shim)
+            except OSError:
+                shutil.copy2(bundled_ffmpeg, shim)
     if os.name != "nt":
         shim.chmod(shim.stat().st_mode | 0o111)
 

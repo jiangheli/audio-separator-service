@@ -58,6 +58,7 @@ class ProcessingRepository:
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     model TEXT NOT NULL,
+                    device TEXT,
                     output_path TEXT NOT NULL,
                     duration_seconds REAL,
                     used_video_copy INTEGER,
@@ -68,6 +69,12 @@ class ProcessingRepository:
                 CREATE INDEX IF NOT EXISTS idx_jobs_detected ON jobs(detected_at DESC);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "device" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN device TEXT")
 
     def recover_interrupted(self) -> int:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
@@ -203,6 +210,7 @@ class ProcessingRepository:
             "output_path",
             "error",
             "model",
+            "device",
         }
         values = {key: value for key, value in fields.items() if key in allowed}
         if not values:

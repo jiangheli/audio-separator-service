@@ -7,9 +7,10 @@ Windows GUI 版面向不需要接触 Python、PowerShell、Web 或命令行的�
 1. 运行 `StemFlow-Setup-<版本>-x64.exe`；
 2. 从开始菜单或桌面打开 StemFlow；
 3. 选择输入文件夹和输出文件夹；
-4. 查看内存评估，选择 1–8 个并发任务，或点击“使用建议值”；
-5. 点击“开始处理”；
-6. 完成后点击“打开输出文件夹”。
+4. 选择仅 CPU、仅 NVIDIA GPU 或 CPU + GPU；
+5. 查看内存/显存评估并设置 CPU、GPU 并发数；
+6. 点击“开始处理”；
+7. 完成后点击“打开输出文件夹”。
 
 输入文件夹可以包含多级子目录。输出目录保留相对结构，并生成：
 
@@ -19,13 +20,25 @@ Windows GUI 版面向不需要接触 Python、PowerShell、Web 或命令行的�
 
 最终视频保留原画面，只使用 AI 分离后的人声音轨，不生成 BGM WAV。
 
-## 并发与内存评估
+## CPU、GPU、混合运行与实时并发
+
+“运行设备”提供三种模式：
+
+- **仅 CPU**：所有视频由 CPU worker 处理；
+- **仅 NVIDIA GPU**：所有视频交给 CUDA worker；
+- **CPU + NVIDIA GPU**：两类 worker 同时从同一任务队列领取视频。
+
+CPU 和 GPU 并发数可以在运行期间调整。增加并发后会立即领取更多待处理视频；降低
+并发不会强行中断正在处理的视频，而是在当前视频完成后停止补充超出新上限的 worker。
+CPU 与 GPU 总并发最多为 8。
 
 GUI 会读取 Windows 当前的物理内存总量、可用内存和 CPU 核心数，并显示：
 
 - 当前可用内存；
 - 所选并发数的预计内存占用；
 - 建议并发数。
+
+检测到 NVIDIA 显卡时，还会显示显卡型号、可用显存、GPU 并发预计显存和建议值。
 
 内存估算按程序基础占用约 2 GB、每个 MDX 推理任务约 3 GB 计算。实际占用会受
 视频长度、音频声道和模型影响，因此这是安全配置参考，不是硬性限制。用户可以选择
@@ -35,6 +48,45 @@ GUI 会读取 Windows 当前的物理内存总量、可用内存和 CPU 核心�
 可使用的 CPU 线程。例如 16 核 CPU、4 个并发时，每个 worker 使用约 4 个 CPU
 线程。
 
+## 逐集实时记录
+
+任务表每 0.75 秒刷新一次，每一集实时显示：
+
+- 当前阶段：排队、提取音轨、分离人声、合成视频、完成或失败；
+- 实际执行设备：CPU 或 CUDA；
+- 当前耗时或最终耗时；
+- 成功输出路径；
+- 失败错误原因。
+
+状态持续写入 SQLite，阶段与错误写入滚动日志，并同步更新 Excel 报表。关闭 GUI
+后重新打开，历史成功和失败记录仍然存在。
+
+## 按需安装 NVIDIA CUDA
+
+基础安装包自带 CPU 环境。检测到 NVIDIA 显卡后，可以在 GUI 点击“安装 CUDA
+加速”，从以下官方地址下载 CUDA PyTorch：
+
+```text
+https://download.pytorch.org/whl/cu128
+```
+
+地址会显示在界面中并可复制。CUDA 组件约需下载 3 GB，安装后约占用 7–10 GB，
+独立存放在：
+
+```text
+%ProgramData%\StemFlow\gpu-runtime
+```
+
+下载、安装和验证过程实时显示，并持久记录在：
+
+```text
+%ProgramData%\StemFlow\logs\cuda-install.log
+```
+
+CUDA 安装失败不会破坏 CPU 环境。GPU 任务使用独立 CUDA worker 进程，因此混合
+模式能够真正让 CPU 和 GPU 同时处理不同视频。NVIDIA 驱动必须预先安装，且
+`nvidia-smi` 应能正常显示显卡。
+
 ## 安装包包含
 
 - Python 3.12 运行时；
@@ -42,7 +94,8 @@ GUI 会读取 Windows 当前的物理内存总量、可用内存和 CPU 核心�
 - FFmpeg；
 - `UVR-MDX-NET-Inst_HQ_3.onnx` 默认模型及模型参数；
 - Microsoft Visual C++ 2015–2022 x64 运行库安装程序；
-- GUI、SQLite 状态库、Excel 报告和日志功能。
+- GUI、SQLite 状态库、Excel 报告和日志功能；
+- CUDA 运行环境安装器与官方下载入口。
 
 安装后首次启动不需要再安装 Python，也不需要下载默认模型。
 
@@ -63,6 +116,7 @@ C:\ProgramData\StemFlow\
 ├── processing_status.xlsx
 ├── models\
 ├── logs\
+├── gpu-runtime\
 └── work\
 ```
 
@@ -73,8 +127,9 @@ C:\ProgramData\StemFlow\
 
 - Windows 10/11 x64 或 Windows Server 2016/2019/2022/2025；
 - 建议 8 核 CPU、16 GB 内存；4 个并发建议至少 16 GB 可用内存；
-- 安装包约数百 MB，安装后需要预留约 2–4 GB；
-- CPU 版无需 NVIDIA GPU，也无需 CUDA。
+- 基础安装包约数百 MB，CPU 使用需要预留约 2–4 GB；
+- 启用 CUDA 时额外预留 7–10 GB；
+- 没有 NVIDIA GPU 时直接选择“仅 CPU”。
 
 ## 构建安装包
 
@@ -83,13 +138,13 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.2.6"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.3.0"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.2.6-x64.exe
+dist\installer\StemFlow-Setup-1.3.0-x64.exe
 ```
 
 也可以手动触发 GitHub Actions 的 `Build Windows GUI installer` 工作流。

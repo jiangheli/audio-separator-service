@@ -108,7 +108,7 @@ class ProcessingReport:
             })
 
             sheet.set_row(0, 30)
-            sheet.merge_range("A1:O1", "StemFlow 视频去 BGM 处理记录", title)
+            sheet.merge_range("A1:P1", "StemFlow 视频去 BGM 处理记录", title)
             sheet.write("A2", "监控目录", label)
             sheet.merge_range("B2:E2", str(config.input_dir), value)
             sheet.write("F2", "输出目录", label)
@@ -164,6 +164,7 @@ class ProcessingReport:
                 "完成时间",
                 "处理耗时(秒)",
                 "模型",
+                "执行设备",
                 "画面直拷",
                 "输出视频",
                 "错误信息",
@@ -209,17 +210,23 @@ class ProcessingReport:
                 else:
                     sheet.write_number(row, 8, float(job["duration_seconds"]), decimal)
                 sheet.write(row, 9, job.get("model") or "", text)
-                video_copy = job.get("used_video_copy")
                 sheet.write(
                     row,
                     10,
+                    str(job.get("device") or "").upper(),
+                    text,
+                )
+                video_copy = job.get("used_video_copy")
+                sheet.write(
+                    row,
+                    11,
                     "" if video_copy is None else ("是" if video_copy else "否，已转码"),
                     text,
                 )
-                sheet.write(row, 11, job.get("output_path") or "", text)
-                sheet.write(row, 12, job.get("error") or "", text)
-                sheet.write(row, 13, job["source_path"], text)
-                sheet.write(row, 14, job["fingerprint"], text)
+                sheet.write(row, 12, job.get("output_path") or "", text)
+                sheet.write(row, 13, job.get("error") or "", text)
+                sheet.write(row, 14, job["source_path"], text)
+                sheet.write(row, 15, job["fingerprint"], text)
 
             last_row = max(6, len(jobs) + 5)
             sheet.autofilter(5, 0, last_row, len(headers) - 1)
@@ -231,10 +238,11 @@ class ProcessingReport:
             sheet.set_column("I:I", 15)
             sheet.set_column("J:J", 28)
             sheet.set_column("K:K", 13)
-            sheet.set_column("L:L", 52)
-            sheet.set_column("M:M", 48)
-            sheet.set_column("N:N", 52)
-            sheet.set_column("O:O", 66, None, {"hidden": True})
+            sheet.set_column("L:L", 13)
+            sheet.set_column("M:M", 52)
+            sheet.set_column("N:N", 48)
+            sheet.set_column("O:O", 52)
+            sheet.set_column("P:P", 66, None, {"hidden": True})
         finally:
             workbook.close()
         os.replace(temporary, self.report_path)

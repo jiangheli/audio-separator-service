@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, Tk, filedialog, messagebox
 from tkinter import ttk
@@ -17,7 +18,20 @@ from typing import Any
 
 from app.cli.main import make_runner
 from app.config import ServiceConfig
+from app.gpu_runtime import (
+    CUDA_INDEX_URL,
+    cuda_runtime_available,
+    install_cuda_runtime,
+    read_marker,
+    runtime_ready,
+)
+from app.hardware import (
+    gpu_memory_estimate_gb,
+    recommended_gpu_workers,
+    runtime_hardware,
+)
 from app.repository import ProcessingRepository
+from app.runner import ConcurrencyController
 
 
 APP_NAME = "StemFlow"
@@ -26,6 +40,12 @@ DEFAULT_MODEL = "mdx"
 MAX_WORKERS = 8
 BASE_MEMORY_GB = 2.0
 MEMORY_PER_WORKER_GB = 3.0
+EXECUTION_MODES = {
+    "cpu": "仅 CPU",
+    "cuda": "仅 NVIDIA GPU",
+    "hybrid": "CPU + NVIDIA GPU",
+}
+MODE_LABEL_TO_KEY = {label: key for key, label in EXECUTION_MODES.items()}
 STATUS_LABELS = {
     "waiting_copy": "等待文件稳定",
     "pending": "排队中",
@@ -156,6 +176,10 @@ def default_settings() -> dict[str, Any]:
         "keep_failed_work": False,
         "video_copy": True,
         "worker_count": 1,
+        "execution_mode": "cpu",
+        "cpu_worker_count": 1,
+        "gpu_worker_count": 1,
+        "cuda_index_url": CUDA_INDEX_URL,
     }
 
 
@@ -208,7 +232,12 @@ def configure_scheduled_task(enabled: bool, schedule_time: str) -> None:
         return
     if enabled:
         executable = Path(sys.executable).resolve()
-        task_command = f'"{executable}" --run-scheduled'
+        if getattr(sys, "frozen", False):
+            task_command = f'"{executable}" --run-scheduled'
+        else:
+            task_command = (
+                f'"{executable}" -m app.gui --run-scheduled --gpu-runtime'
+            )
         command = [
             "schtasks.exe",
             "/Create",
@@ -277,14 +306,29 @@ class StemFlowGUI:
         self.root = root
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.runtime_installer: threading.Thread | None = None
+        self.concurrency: ConcurrencyController | None = None
         self.stop_requested = threading.Event()
         self.settings = load_settings()
+        prepare_bundled_assets(self.settings)
 
         self.input_var = StringVar(value=str(self.settings["input_dir"]))
         self.output_var = StringVar(value=str(self.settings["output_dir"]))
         self.model_var = StringVar(value=str(self.settings.get("model", DEFAULT_MODEL)))
-        self.worker_count = StringVar(
-            value=str(self.settings.get("worker_count", 1))
+        configured_mode = str(self.settings.get("execution_mode", "cpu"))
+        self.execution_mode = StringVar(
+            value=EXECUTION_MODES.get(configured_mode, EXECUTION_MODES["cpu"])
+        )
+        self.cpu_worker_count = StringVar(
+            value=str(
+                self.settings.get(
+                    "cpu_worker_count",
+                    self.settings.get("worker_count", 1),
+                )
+            )
+        )
+        self.gpu_worker_count = StringVar(
+            value=str(self.settings.get("gpu_worker_count", 1))
         )
         self.schedule_enabled = BooleanVar(
             value=bool(self.settings.get("schedule_enabled", False))
@@ -295,22 +339,28 @@ class StemFlowGUI:
         self.status_var = StringVar(value="就绪")
         self.summary_var = StringVar(value="选择输入和输出文件夹后开始处理")
         self.resource_var = StringVar()
+        self.device_var = StringVar(value="正在检测硬件…")
+        self.cuda_url_var = StringVar(value=CUDA_INDEX_URL)
         self.total_memory_gb, self.available_memory_gb = system_memory_gb()
+        self.hardware = runtime_hardware()
+        self.cuda_ready = cuda_runtime_available() if runtime_ready() else False
         self.recommended_workers = recommended_worker_count(
             self.total_memory_gb,
             self.available_memory_gb,
         )
+        self.recommended_gpu_workers = recommended_gpu_workers(self.hardware.gpu)
 
         self._configure_window()
         self._build_ui()
         self._refresh_jobs()
         self.root.after(200, self._drain_events)
+        self.root.after(750, self._poll_jobs)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_window(self) -> None:
         self.root.title("StemFlow 视频纯人声工具")
-        self.root.geometry("1040x720")
-        self.root.minsize(880, 620)
+        self.root.geometry("1180x800")
+        self.root.minsize(980, 680)
         self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
 
         style = ttk.Style(self.root)
@@ -362,42 +412,92 @@ class StemFlowGUI:
             command=lambda: self._choose_directory(self.output_var),
         ).grid(row=1, column=2, pady=(10, 0))
 
-        ttk.Label(settings, text="分离引擎").grid(
+        ttk.Label(settings, text="运行设备").grid(
             row=2, column=0, sticky="w", pady=(10, 0)
         )
+        device_frame = ttk.Frame(settings)
+        device_frame.grid(row=2, column=1, sticky="w", padx=10, pady=(10, 0))
+        mode_picker = ttk.Combobox(
+            device_frame,
+            textvariable=self.execution_mode,
+            values=tuple(EXECUTION_MODES.values()),
+            state="readonly",
+            width=12,
+        )
+        mode_picker.pack(side="left")
+        mode_picker.bind("<<ComboboxSelected>>", self._apply_live_concurrency)
         ttk.Label(
-            settings,
-            text="MDX 本地人声模型（已内置）",
+            device_frame,
+            textvariable=self.device_var,
             style="Subtitle.TLabel",
-        ).grid(row=2, column=1, sticky="w", padx=10, pady=(10, 0))
+        ).pack(side="left", padx=(12, 0))
 
-        ttk.Label(settings, text="并发任务数").grid(
+        self.install_cuda_button = ttk.Button(
+            settings,
+            text="安装 CUDA 加速",
+            command=self._install_cuda,
+        )
+        self.install_cuda_button.grid(row=2, column=2, pady=(10, 0))
+
+        ttk.Label(settings, text="实时并发").grid(
             row=3, column=0, sticky="w", pady=(10, 0)
         )
         worker_frame = ttk.Frame(settings)
         worker_frame.grid(row=3, column=1, sticky="w", padx=10, pady=(10, 0))
-        worker_picker = ttk.Combobox(
+        ttk.Label(worker_frame, text="CPU").pack(side="left")
+        self.cpu_worker_picker = ttk.Combobox(
             worker_frame,
-            textvariable=self.worker_count,
+            textvariable=self.cpu_worker_count,
             values=tuple(str(value) for value in range(1, MAX_WORKERS + 1)),
             state="readonly",
-            width=6,
+            width=5,
         )
-        worker_picker.pack(side="left")
-        worker_picker.bind("<<ComboboxSelected>>", self._update_resource_label)
+        self.cpu_worker_picker.pack(side="left", padx=(5, 14))
+        self.cpu_worker_picker.bind(
+            "<<ComboboxSelected>>",
+            self._apply_live_concurrency,
+        )
+        ttk.Label(worker_frame, text="GPU").pack(side="left")
+        self.gpu_worker_picker = ttk.Combobox(
+            worker_frame,
+            textvariable=self.gpu_worker_count,
+            values=tuple(str(value) for value in range(1, MAX_WORKERS + 1)),
+            state="readonly",
+            width=5,
+        )
+        self.gpu_worker_picker.pack(side="left", padx=(5, 14))
+        self.gpu_worker_picker.bind(
+            "<<ComboboxSelected>>",
+            self._apply_live_concurrency,
+        )
         ttk.Button(
             worker_frame,
             text="使用建议值",
             command=self._use_recommended_workers,
-        ).pack(side="left", padx=(10, 0))
+        ).pack(side="left")
+
         ttk.Label(
             settings,
             textvariable=self.resource_var,
             style="Subtitle.TLabel",
         ).grid(row=4, column=1, sticky="w", padx=10, pady=(6, 0))
 
+        cuda_link = ttk.Frame(settings)
+        cuda_link.grid(row=5, column=1, sticky="w", padx=10, pady=(6, 0))
+        ttk.Label(cuda_link, text="CUDA 下载地址：").pack(side="left")
+        ttk.Label(
+            cuda_link,
+            textvariable=self.cuda_url_var,
+            style="Subtitle.TLabel",
+        ).pack(side="left")
+        ttk.Button(
+            cuda_link,
+            text="复制",
+            command=self._copy_cuda_url,
+        ).pack(side="left", padx=(8, 0))
+
         schedule_frame = ttk.Frame(settings)
-        schedule_frame.grid(row=5, column=1, sticky="w", padx=10, pady=(10, 0))
+        schedule_frame.grid(row=6, column=1, sticky="w", padx=10, pady=(10, 0))
         ttk.Checkbutton(
             schedule_frame,
             text="每天自动运行",
@@ -413,7 +513,7 @@ class StemFlowGUI:
             settings,
             text="保存定时",
             command=self._save_schedule,
-        ).grid(row=5, column=2, pady=(10, 0))
+        ).grid(row=6, column=2, pady=(10, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=14)
@@ -444,7 +544,7 @@ class StemFlowGUI:
 
         table_frame = ttk.LabelFrame(outer, text="处理记录", padding=8)
         table_frame.pack(fill="both", expand=True)
-        columns = ("status", "file", "duration", "output")
+        columns = ("status", "file", "device", "duration", "output", "error")
         self.jobs = ttk.Treeview(
             table_frame,
             columns=columns,
@@ -453,12 +553,19 @@ class StemFlowGUI:
         )
         self.jobs.heading("status", text="状态")
         self.jobs.heading("file", text="文件")
+        self.jobs.heading("device", text="设备")
         self.jobs.heading("duration", text="耗时")
         self.jobs.heading("output", text="输出")
+        self.jobs.heading("error", text="失败原因")
         self.jobs.column("status", width=110, stretch=False)
-        self.jobs.column("file", width=300)
+        self.jobs.column("file", width=245)
+        self.jobs.column("device", width=70, stretch=False)
         self.jobs.column("duration", width=90, stretch=False)
-        self.jobs.column("output", width=390)
+        self.jobs.column("output", width=300)
+        self.jobs.column("error", width=260)
+        self.jobs.tag_configure("completed", foreground="#047857")
+        self.jobs.tag_configure("failed", foreground="#B91C1C")
+        self.jobs.tag_configure("active", foreground="#6D28D9")
         scrollbar = ttk.Scrollbar(
             table_frame,
             orient="vertical",
@@ -478,24 +585,168 @@ class StemFlowGUI:
             font=("Consolas", 9),
         )
         self.log.pack(fill="both", expand=True)
+        self._update_mode_controls()
         self._update_resource_label()
 
     def _use_recommended_workers(self) -> None:
-        self.worker_count.set(str(self.recommended_workers))
+        mode = self._selected_mode()
+        if mode == "hybrid":
+            gpu = min(self.recommended_gpu_workers, MAX_WORKERS - 1)
+            cpu = min(self.recommended_workers, MAX_WORKERS - gpu)
+            self.cpu_worker_count.set(str(max(1, cpu)))
+            self.gpu_worker_count.set(str(max(1, gpu)))
+        elif mode == "cuda":
+            self.gpu_worker_count.set(str(self.recommended_gpu_workers))
+        else:
+            self.cpu_worker_count.set(str(self.recommended_workers))
+        self._apply_live_concurrency()
+
+    def _selected_mode(self) -> str:
+        return MODE_LABEL_TO_KEY.get(self.execution_mode.get(), "cpu")
+
+    def _selected_allocation(self) -> tuple[int, int]:
+        mode = self._selected_mode()
+        cpu = int(self.cpu_worker_count.get() or "1") if mode != "cuda" else 0
+        gpu = int(self.gpu_worker_count.get() or "1") if mode != "cpu" else 0
+        if cpu + gpu > MAX_WORKERS:
+            raise ValueError(f"CPU 与 GPU 总并发不能超过 {MAX_WORKERS}")
+        return cpu, gpu
+
+    def _update_mode_controls(self) -> None:
+        mode = self._selected_mode()
+        self.cpu_worker_picker.configure(
+            state="readonly" if mode != "cuda" else "disabled"
+        )
+        self.gpu_worker_picker.configure(
+            state="readonly" if mode != "cpu" else "disabled"
+        )
+
+    def _apply_live_concurrency(self, _event: object | None = None) -> None:
+        self._update_mode_controls()
+        try:
+            cpu, gpu = self._selected_allocation()
+        except ValueError as error:
+            messagebox.showerror("并发设置错误", str(error))
+            return
         self._update_resource_label()
+        if self.concurrency is None:
+            return
+        if gpu and not self.cuda_ready:
+            messagebox.showwarning(
+                "CUDA 尚未启用",
+                "请先安装并验证 NVIDIA CUDA 加速组件。",
+            )
+            return
+        self.concurrency.set_allocation(
+            cpu_workers=cpu,
+            gpu_workers=gpu,
+        )
+        self.settings.update(
+            {
+                "execution_mode": self._selected_mode(),
+                "cpu_worker_count": int(self.cpu_worker_count.get()),
+                "gpu_worker_count": int(self.gpu_worker_count.get()),
+                "worker_count": cpu + gpu,
+            }
+        )
+        save_settings(self.settings)
+        self._append_log(
+            f"并发已实时调整：CPU {cpu}，GPU {gpu}；"
+            "已在运行的任务会完成，后续任务按新设置调度。"
+        )
 
     def _update_resource_label(self, _event: object | None = None) -> None:
-        selected = max(1, int(self.worker_count.get() or "1"))
-        estimate = estimated_memory_gb(selected)
+        try:
+            cpu, gpu = self._selected_allocation()
+        except ValueError:
+            cpu, gpu = 1, 0
+        estimate = estimated_memory_gb(cpu + gpu)
+        gpu_estimate = gpu_memory_estimate_gb(gpu) if gpu else 0.0
         if self.total_memory_gb > 0:
-            self.resource_var.set(
+            text = (
                 f"内存：总计 {self.total_memory_gb:.1f} GB，可用 "
                 f"{self.available_memory_gb:.1f} GB；预计需要约 {estimate:.1f} GB；"
-                f"建议 {self.recommended_workers} 个并发"
+                f"CPU 建议 {self.recommended_workers}"
             )
+            if self.hardware.gpu:
+                text += (
+                    f"；显存可用 {self.hardware.gpu.free_memory_gb:.1f} GB"
+                    f"，GPU {gpu} 并发预计约 {gpu_estimate:.1f} GB"
+                    f"，建议 {self.recommended_gpu_workers}"
+                )
+            self.resource_var.set(text)
         else:
             self.resource_var.set(
                 f"预计需要约 {estimate:.1f} GB；建议从 1 个并发开始"
+            )
+        if self.cuda_ready:
+            gpu_name = self.hardware.gpu.name if self.hardware.gpu else "NVIDIA GPU"
+            self.device_var.set(f"CUDA 可用：{gpu_name}")
+        else:
+            self.device_var.set(self.hardware.detail)
+        if runtime_ready():
+            marker = read_marker()
+            self.cuda_url_var.set(str(marker.get("cuda_index_url", CUDA_INDEX_URL)))
+        self.install_cuda_button.configure(
+            text=(
+                "CUDA 已安装"
+                if self.cuda_ready
+                else "安装 CUDA 加速"
+            ),
+            state=(
+                "disabled"
+                if self.cuda_ready
+                else "normal"
+            ),
+        )
+
+    def _copy_cuda_url(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.cuda_url_var.get())
+        self.status_var.set("CUDA 下载地址已复制")
+
+    def _install_cuda(self) -> None:
+        if self.runtime_installer and self.runtime_installer.is_alive():
+            return
+        if not self.hardware.gpu:
+            messagebox.showwarning(
+                "未检测到 NVIDIA GPU",
+                "系统没有通过 nvidia-smi 检测到 NVIDIA GPU。"
+                "请先正确安装 NVIDIA 驱动。",
+            )
+            return
+        if not messagebox.askyesno(
+            "安装 NVIDIA CUDA 加速",
+            "将从以下官方地址下载约 3 GB 的 CUDA PyTorch 组件：\n\n"
+            f"{CUDA_INDEX_URL}\n\n"
+            "安装后预计占用 7–10 GB 磁盘空间。是否继续？",
+        ):
+            return
+        self.install_cuda_button.configure(state="disabled", text="正在安装…")
+        self.status_var.set("正在下载并安装 CUDA 加速组件")
+        self.runtime_installer = threading.Thread(
+            target=self._run_cuda_install,
+            daemon=True,
+            name="stemflow-cuda-installer",
+        )
+        self.runtime_installer.start()
+
+    def _run_cuda_install(self) -> None:
+        log_path = program_data_dir() / "logs" / "cuda-install.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def record(line: str) -> None:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{timestamp} | {line}\n")
+            self.events.put(("log", f"CUDA | {line}"))
+
+        try:
+            install_cuda_runtime(record)
+            self.events.put(("cuda-installed", None))
+        except Exception as error:
+            self.events.put(
+                ("cuda-error", f"{type(error).__name__}: {error}")
             )
 
     def _choose_directory(self, target: StringVar) -> None:
@@ -506,6 +757,7 @@ class StemFlowGUI:
     def _current_settings(self) -> dict[str, Any]:
         settings = dict(self.settings)
         data_dir = program_data_dir()
+        cpu_workers, gpu_workers = self._selected_allocation()
         settings.update(
             {
                 "input_dir": self.input_var.get().strip(),
@@ -517,7 +769,11 @@ class StemFlowGUI:
                 "database_path": str(data_dir / "processing.db"),
                 "report_path": str(data_dir / "processing_status.xlsx"),
                 "model": self.model_var.get(),
-                "worker_count": int(self.worker_count.get()),
+                "worker_count": cpu_workers + gpu_workers,
+                "execution_mode": self._selected_mode(),
+                "cpu_worker_count": int(self.cpu_worker_count.get()),
+                "gpu_worker_count": int(self.gpu_worker_count.get()),
+                "cuda_index_url": CUDA_INDEX_URL,
                 "schedule_enabled": self.schedule_enabled.get(),
                 "schedule_time": self.schedule_time.get().strip(),
             }
@@ -525,6 +781,9 @@ class StemFlowGUI:
         return settings
 
     def _validate_and_save(self) -> ServiceConfig:
+        _cpu_workers, gpu_workers = self._selected_allocation()
+        if gpu_workers and not self.cuda_ready:
+            raise ValueError("当前模式需要先安装并验证 NVIDIA CUDA 加速组件")
         settings = self._current_settings()
         config = service_config(settings)
         config.prepare_directories()
@@ -556,6 +815,14 @@ class StemFlowGUI:
         except Exception as error:
             messagebox.showerror("配置错误", str(error))
             return
+        cpu_workers, gpu_workers = self._selected_allocation()
+        if gpu_workers and not self.cuda_ready:
+            messagebox.showwarning(
+                "CUDA 尚未启用",
+                "当前选择需要 NVIDIA GPU。请先点击“安装 CUDA 加速”，"
+                "安装验证成功后再开始。",
+            )
+            return
         self.total_memory_gb, self.available_memory_gb = system_memory_gb()
         required_memory = estimated_memory_gb(config.worker_count)
         if (
@@ -569,8 +836,27 @@ class StemFlowGUI:
             )
         ):
             return
+        if (
+            gpu_workers
+            and self.hardware.gpu
+            and gpu_memory_estimate_gb(gpu_workers)
+            > self.hardware.gpu.free_memory_gb
+            and not messagebox.askyesno(
+                "显存可能不足",
+                f"{gpu_workers} 个 GPU 并发预计需要约 "
+                f"{gpu_memory_estimate_gb(gpu_workers):.1f} GB 显存，"
+                f"当前可用约 {self.hardware.gpu.free_memory_gb:.1f} GB。\n\n"
+                "显存不足可能导致当前集失败，仍然继续吗？",
+            )
+        ):
+            return
 
         self.stop_requested.clear()
+        self.concurrency = ConcurrencyController(1, maximum=MAX_WORKERS)
+        self.concurrency.set_allocation(
+            cpu_workers=cpu_workers,
+            gpu_workers=gpu_workers,
+        )
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status_var.set("正在启动…")
@@ -587,15 +873,22 @@ class StemFlowGUI:
             runner, _repository, logger = make_runner(config)
             handler = QueueLogHandler(self.events)
             logger.addHandler(handler)
-            threads_per_worker = configure_cpu_budget(config.worker_count)
+            cpu_workers, gpu_workers = (
+                self.concurrency.get_allocation()
+                if self.concurrency
+                else (config.worker_count, 0)
+            )
+            threads_per_worker = configure_cpu_budget(max(1, cpu_workers))
             logger.info(
-                "Starting %s concurrent job(s), %s CPU thread(s) per worker",
-                config.worker_count,
+                "Starting workers: CPU=%s, CUDA=%s; %s CPU thread(s) per worker",
+                cpu_workers,
+                gpu_workers,
                 threads_per_worker,
             )
             runner.run_once(
                 max_workers=config.worker_count,
                 stop_event=self.stop_requested,
+                concurrency=self.concurrency,
             )
             self.events.put(("refresh", None))
             self.events.put(("done", None))
@@ -622,12 +915,33 @@ class StemFlowGUI:
                     self._set_idle("运行失败")
                     self._append_log(str(payload))
                     messagebox.showerror("处理失败", str(payload))
+                elif kind == "cuda-installed":
+                    self.cuda_ready = cuda_runtime_available()
+                    self._update_resource_label()
+                    self.status_var.set("CUDA 安装成功，可选择 GPU 或混合模式")
+                    messagebox.showinfo(
+                        "CUDA 安装成功",
+                        "NVIDIA CUDA 加速已经安装并验证成功。"
+                        "现在可以选择“仅 NVIDIA GPU”或“CPU + NVIDIA GPU”。",
+                    )
+                elif kind == "cuda-error":
+                    self.status_var.set("CUDA 安装失败，继续使用 CPU")
+                    self.install_cuda_button.configure(
+                        state="normal",
+                        text="重新安装 CUDA",
+                    )
+                    self._append_log(str(payload))
+                    messagebox.showerror(
+                        "CUDA 安装失败",
+                        f"{payload}\n\nCPU 模式仍可正常使用，详细过程已写入日志。",
+                    )
         except queue.Empty:
             pass
         self.root.after(200, self._drain_events)
 
     def _set_idle(self, status: str) -> None:
         self.status_var.set(status)
+        self.concurrency = None
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
 
@@ -640,6 +954,10 @@ class StemFlowGUI:
             self.log.delete("1.0", f"{lines - 500}.0")
         self.log.configure(state="disabled")
 
+    def _poll_jobs(self) -> None:
+        self._refresh_jobs()
+        self.root.after(750, self._poll_jobs)
+
     def _refresh_jobs(self) -> None:
         try:
             config = service_config(self._current_settings())
@@ -651,24 +969,70 @@ class StemFlowGUI:
 
         self.jobs.delete(*self.jobs.get_children())
         for job in records:
+            duration_value = job.get("duration_seconds")
+            if duration_value is None and job.get("started_at") and str(
+                job.get("status")
+            ) in {
+                "processing",
+                "extracting_audio",
+                "separating_vocals",
+                "composing_video",
+            }:
+                try:
+                    started = datetime.fromisoformat(str(job["started_at"]))
+                    duration_value = (
+                        datetime.now(timezone.utc) - started
+                    ).total_seconds()
+                except ValueError:
+                    duration_value = None
             duration = (
-                f"{float(job['duration_seconds']):.0f} 秒"
-                if job.get("duration_seconds") is not None
+                f"{float(duration_value):.0f} 秒"
+                if duration_value is not None
                 else "—"
+            )
+            status = str(job["status"])
+            tag = (
+                "completed"
+                if status == "completed"
+                else "failed"
+                if status == "failed"
+                else "active"
+                if status in {
+                    "processing",
+                    "extracting_audio",
+                    "separating_vocals",
+                    "composing_video",
+                }
+                else ""
             )
             self.jobs.insert(
                 "",
                 "end",
+                iid=str(job["id"]),
                 values=(
-                    STATUS_LABELS.get(str(job["status"]), str(job["status"])),
+                    STATUS_LABELS.get(status, status),
                     Path(str(job["source_path"])).name,
+                    str(job.get("device") or "—").upper(),
                     duration,
-                    str(job["output_path"]),
+                    str(job["output_path"]) if status == "completed" else "—",
+                    str(job.get("error") or "").replace("\n", " | ")[:240],
                 ),
+                tags=(tag,) if tag else (),
             )
+        active = sum(
+            counts.get(status, 0)
+            for status in (
+                "processing",
+                "extracting_audio",
+                "separating_vocals",
+                "composing_video",
+            )
+        )
         self.summary_var.set(
-            "全部 {total} · 已完成 {completed} · 失败 {failed} · 排队 {pending}".format(
+            "全部 {total} · 处理中 {active} · 已完成 {completed} · "
+            "失败 {failed} · 排队 {pending}".format(
                 total=counts.get("total", 0),
+                active=active,
                 completed=counts.get("completed", 0),
                 failed=counts.get("failed", 0),
                 pending=counts.get("pending", 0),
@@ -676,6 +1040,12 @@ class StemFlowGUI:
         )
 
     def _on_close(self) -> None:
+        if self.runtime_installer and self.runtime_installer.is_alive():
+            messagebox.showwarning(
+                "CUDA 正在安装",
+                "请等待 CUDA 组件下载和安装完成，避免留下不完整运行环境。",
+            )
+            return
         if self.worker and self.worker.is_alive():
             messagebox.showwarning(
                 "任务正在运行",
@@ -691,8 +1061,27 @@ def run_scheduled() -> int:
         prepare_bundled_assets(settings)
         config = service_config(settings)
         runner, _repository, _logger = make_runner(config)
-        configure_cpu_budget(config.worker_count)
-        runner.run_once(max_workers=config.worker_count)
+        mode = str(settings.get("execution_mode", "cpu"))
+        cpu_workers = (
+            int(settings.get("cpu_worker_count", config.worker_count))
+            if mode != "cuda"
+            else 0
+        )
+        gpu_workers = (
+            int(settings.get("gpu_worker_count", 1))
+            if mode != "cpu"
+            else 0
+        )
+        controller = ConcurrencyController(1, maximum=MAX_WORKERS)
+        controller.set_allocation(
+            cpu_workers=cpu_workers,
+            gpu_workers=gpu_workers,
+        )
+        configure_cpu_budget(max(1, cpu_workers))
+        runner.run_once(
+            max_workers=cpu_workers + gpu_workers,
+            concurrency=controller,
+        )
         return 0
     except Exception:
         logging.exception("Scheduled StemFlow run failed")
