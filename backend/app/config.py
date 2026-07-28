@@ -40,6 +40,11 @@ class ServiceConfig:
     keep_failed_work: bool = False
     video_copy: bool = True
     worker_count: int = 1
+    gpu_worker_count: int = 1
+    gpu_prepare_threads: int = 2
+    gpu_compose_threads: int = 2
+    gpu_prefetch: int = 2
+    gpu_cpu_threads: int = 4
 
     @classmethod
     def load(cls, config_path: str | Path) -> "ServiceConfig":
@@ -87,6 +92,11 @@ class ServiceConfig:
             keep_failed_work=bool(raw.get("keep_failed_work", False)),
             video_copy=bool(raw.get("video_copy", True)),
             worker_count=int(raw.get("worker_count", 1)),
+            gpu_worker_count=int(raw.get("gpu_worker_count", 1)),
+            gpu_prepare_threads=int(raw.get("gpu_prepare_threads", 2)),
+            gpu_compose_threads=int(raw.get("gpu_compose_threads", 2)),
+            gpu_prefetch=int(raw.get("gpu_prefetch", 2)),
+            gpu_cpu_threads=int(raw.get("gpu_cpu_threads", 4)),
         )
         config.validate()
         return config
@@ -100,6 +110,14 @@ class ServiceConfig:
             raise ValueError("max_retries must be between 0 and 20")
         if self.worker_count < 1:
             raise ValueError("worker_count must be at least 1")
+        if self.gpu_worker_count < 0:
+            raise ValueError("gpu_worker_count cannot be negative")
+        if self.gpu_prepare_threads < 1 or self.gpu_compose_threads < 1:
+            raise ValueError("GPU prepare and compose threads must be at least 1")
+        if self.gpu_prefetch < 0:
+            raise ValueError("gpu_prefetch cannot be negative")
+        if self.gpu_cpu_threads < 1:
+            raise ValueError("gpu_cpu_threads must be at least 1")
         if not self.output_suffix or any(char in self.output_suffix for char in '<>:"/\\|?*'):
             raise ValueError("output_suffix contains invalid filename characters")
         if not re.fullmatch(r"\d{2,4}k", self.audio_bitrate):

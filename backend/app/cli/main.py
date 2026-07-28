@@ -115,6 +115,11 @@ def make_runner(
         audio_bitrate=config.audio_bitrate,
         keep_failed_work=config.keep_failed_work,
         logger=logger,
+        gpu_workers=max(1, config.gpu_worker_count),
+        prepare_threads=config.gpu_prepare_threads,
+        compose_threads=config.gpu_compose_threads,
+        prefetch=config.gpu_prefetch,
+        gpu_cpu_threads=config.gpu_cpu_threads,
     )
     report = ProcessingReport(config.report_path)
     return BatchRunner(config, repository, pipeline, report, logger), repository, logger

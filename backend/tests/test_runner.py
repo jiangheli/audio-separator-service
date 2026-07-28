@@ -255,3 +255,56 @@ def test_controller_allows_zero_per_device_and_has_no_default_cap() -> None:
 
     with pytest.raises(ValueError, match="at least one worker"):
         controller.set_allocation(cpu_workers=0, gpu_workers=0)
+
+
+def test_runner_expands_cuda_slots_for_pipeline_stages(tmp_path: Path) -> None:
+    class PipelinedGpu(FakePipeline):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+            self.warmed = 0
+
+        def warm_gpu(self, workers: int) -> None:
+            self.warmed = workers
+
+        def scheduling_target(self, device: str, workers: int) -> int:
+            return workers + 4 if device == "cuda" and workers else workers
+
+        def process(self, *args: object, **kwargs: object) -> VideoProcessResult:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.05)
+                return super().process(*args, **kwargs)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    config = make_config(tmp_path)
+    config.prepare_directories()
+    for index in range(5):
+        (config.input_dir / f"pipeline-{index}.mp4").write_bytes(b"video")
+    repository = ProcessingRepository(config.database_path)
+    pipeline = PipelinedGpu()
+    runner = BatchRunner(
+        config,
+        repository,
+        pipeline,
+        ProcessingReport(config.report_path),
+        logging.getLogger("test-pipelined-gpu"),
+    )
+    controller = ConcurrencyController(1)
+    controller.set_allocation(cpu_workers=0, gpu_workers=1)
+
+    result = runner.run_once(
+        max_workers=1,
+        concurrency=controller,
+    )
+
+    assert result["completed"] == 5
+    assert pipeline.warmed == 1
+    assert pipeline.max_active >= 3
+    assert set(pipeline.devices) == {"cuda"}

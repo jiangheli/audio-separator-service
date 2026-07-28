@@ -183,6 +183,10 @@ def default_settings() -> dict[str, Any]:
         "execution_mode": "cpu",
         "cpu_worker_count": 1,
         "gpu_worker_count": 1,
+        "gpu_prepare_threads": 2,
+        "gpu_compose_threads": 2,
+        "gpu_prefetch": 2,
+        "gpu_cpu_threads": 4,
         "cuda_index_url": CUDA_INDEX_URL,
     }
 
@@ -335,6 +339,18 @@ class StemFlowGUI:
         )
         self.gpu_worker_count = StringVar(
             value=str(self.settings.get("gpu_worker_count", 1))
+        )
+        self.gpu_prepare_threads = StringVar(
+            value=str(self.settings.get("gpu_prepare_threads", 2))
+        )
+        self.gpu_compose_threads = StringVar(
+            value=str(self.settings.get("gpu_compose_threads", 2))
+        )
+        self.gpu_prefetch = StringVar(
+            value=str(self.settings.get("gpu_prefetch", 2))
+        )
+        self.gpu_cpu_threads = StringVar(
+            value=str(self.settings.get("gpu_cpu_threads", 4))
         )
         self.schedule_enabled = BooleanVar(
             value=bool(self.settings.get("schedule_enabled", False))
@@ -499,14 +515,43 @@ class StemFlowGUI:
             command=self._use_recommended_workers,
         ).pack(side="left")
 
+        ttk.Label(settings, text="GPU 流水线").grid(
+            row=4,
+            column=0,
+            sticky="w",
+            pady=(10, 0),
+        )
+        pipeline_frame = ttk.Frame(settings)
+        pipeline_frame.grid(
+            row=4,
+            column=1,
+            sticky="w",
+            padx=10,
+            pady=(10, 0),
+        )
+        for label, variable, values in (
+            ("预处理", self.gpu_prepare_threads, range(1, 9)),
+            ("合成", self.gpu_compose_threads, range(1, 9)),
+            ("预取", self.gpu_prefetch, range(9)),
+            ("GPU辅助CPU", self.gpu_cpu_threads, range(1, 9)),
+        ):
+            ttk.Label(pipeline_frame, text=label).pack(side="left")
+            ttk.Combobox(
+                pipeline_frame,
+                textvariable=variable,
+                values=tuple(str(value) for value in values),
+                state="normal",
+                width=4,
+            ).pack(side="left", padx=(4, 12))
+
         ttk.Label(
             settings,
             textvariable=self.resource_var,
             style="Subtitle.TLabel",
-        ).grid(row=4, column=1, sticky="w", padx=10, pady=(6, 0))
+        ).grid(row=5, column=1, sticky="w", padx=10, pady=(6, 0))
 
         cuda_link = ttk.Frame(settings)
-        cuda_link.grid(row=5, column=1, sticky="w", padx=10, pady=(6, 0))
+        cuda_link.grid(row=6, column=1, sticky="w", padx=10, pady=(6, 0))
         ttk.Label(cuda_link, text="内置 CUDA 来源：").pack(side="left")
         ttk.Label(
             cuda_link,
@@ -525,7 +570,7 @@ class StemFlowGUI:
         ).pack(side="left", padx=(8, 0))
 
         schedule_frame = ttk.Frame(settings)
-        schedule_frame.grid(row=6, column=1, sticky="w", padx=10, pady=(10, 0))
+        schedule_frame.grid(row=7, column=1, sticky="w", padx=10, pady=(10, 0))
         ttk.Checkbutton(
             schedule_frame,
             text="每天自动运行",
@@ -541,7 +586,7 @@ class StemFlowGUI:
             settings,
             text="保存定时",
             command=self._save_schedule,
-        ).grid(row=6, column=2, pady=(10, 0))
+        ).grid(row=7, column=2, pady=(10, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=14)
@@ -985,6 +1030,10 @@ class StemFlowGUI:
                 "execution_mode": self._selected_mode(),
                 "cpu_worker_count": int(self.cpu_worker_count.get()),
                 "gpu_worker_count": int(self.gpu_worker_count.get()),
+                "gpu_prepare_threads": int(self.gpu_prepare_threads.get()),
+                "gpu_compose_threads": int(self.gpu_compose_threads.get()),
+                "gpu_prefetch": int(self.gpu_prefetch.get()),
+                "gpu_cpu_threads": int(self.gpu_cpu_threads.get()),
                 "cuda_index_url": CUDA_INDEX_URL,
                 "schedule_enabled": self.schedule_enabled.get(),
                 "schedule_time": self.schedule_time.get().strip(),

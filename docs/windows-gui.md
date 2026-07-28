@@ -33,6 +33,33 @@ CPU 和 GPU 并发数可以在运行期间调整。增加并发后会立即领�
 CPU 和 GPU 都可以直接输入任意非负整数，不设固定上限。单项可以设为 `0` 以禁用
 该设备，例如 `CPU 0 + GPU 1` 或 `CPU 4 + GPU 0`；两项不能同时为 `0`。
 
+### 常驻 GPU 与三级流水线
+
+GPU 模式启动批次时会先启动长期运行的 CUDA worker，通过
+`python-audio-separator` 的公开 Python API 加载一次模型。后续视频复用同一个
+进程和模型，不再重复导入 PyTorch、初始化 CUDA 或加载 ONNX 模型。运行日志会
+记录 CUDA Provider、显卡名称、模型加载时间、整卡显存使用量和每条推理耗时。
+
+GPU 视频采用有界三级流水线：
+
+```text
+CPU 音频预处理（默认 2）
+        ↓
+常驻 GPU 模型推理（8 GB 显卡默认 1）
+        ↓
+CPU 视频合成（默认 2）
+```
+
+最多提前准备 2 条音频，避免任务缓存无限占用内存。GUI 的“GPU 流水线”可调整
+预处理线程、合成线程、预取数量和 GPU 辅助 CPU 线程。RTX 4060/5060 Ti 8 GB
+建议从 `CPU模型 0、GPU 1、预处理 2、合成 2、预取 2、GPU辅助CPU 4` 开始。
+
+人声合成首先使用 `-c:v copy` 直接复制原画面，不重新编码、不损失画质。源视频
+无法直接封装时，GPU 模式先尝试 `h264_nvenc`，不可用时再回退 `libx264`。
+STFT、iSTFT 和频谱张量是否完整留在 CUDA 由底层
+`python-audio-separator`/模型实现决定；StemFlow 只设置它公开支持的 CUDA
+设备和 ONNX `CUDAExecutionProvider`，不修改上游核心推理逻辑。
+
 GUI 会读取 Windows 当前的物理内存总量、可用内存和 CPU 核心数，并显示：
 
 - 当前可用内存；
@@ -177,17 +204,17 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.5.0"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.6.0"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.5.0-x64.exe
-dist\installer\StemFlow-Setup-1.5.0-x64-1.bin
-dist\installer\StemFlow-Setup-1.5.0-x64-2.bin
-dist\update\StemFlow-Update-1.5.0-x64.exe
-dist\update\StemFlow-Update-1.5.0-x64.exe.sha256
+dist\installer\StemFlow-Setup-1.6.0-x64.exe
+dist\installer\StemFlow-Setup-1.6.0-x64-1.bin
+dist\installer\StemFlow-Setup-1.6.0-x64-2.bin
+dist\update\StemFlow-Update-1.6.0-x64.exe
+dist\update\StemFlow-Update-1.6.0-x64.exe.sha256
 ```
 
 也可以推送 `gui-v<版本>` 标签触发 GitHub Actions。标签构建成功后会自动创建

@@ -1,16 +1,45 @@
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
 from app.models import VideoProcessResult
-from app.services.hybrid_pipeline import EVENT_PREFIX, HybridVideoPipeline
+from app.services.hybrid_pipeline import HybridVideoPipeline
+
+
+class FakeExtractor:
+    def extract_audio(self, _source: Path, target: Path) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"audio")
+        return target
+
+
+class FakeSeparator:
+    default_model = "model.onnx"
+
+
+class FakeComposer:
+    def compose(
+        self,
+        _source: Path,
+        _vocals: Path,
+        output: Path,
+        *,
+        prefer_stream_copy: bool,
+        prefer_nvenc: bool = False,
+    ) -> bool:
+        assert prefer_nvenc is True
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"video")
+        return prefer_stream_copy
 
 
 class FakeLocalPipeline:
     def __init__(self) -> None:
         self.device = ""
+        self.extractor = FakeExtractor()
+        self.separator = FakeSeparator()
+        self.composer = FakeComposer()
 
     def process(
         self,
@@ -22,10 +51,36 @@ class FakeLocalPipeline:
         return VideoProcessResult(source, output, 1.0, True)
 
 
+class FakeCudaPool:
+    def __init__(self) -> None:
+        self.size = 1
+        self.calls = 0
+
+    def set_size(self, value: int) -> None:
+        self.size = value
+
+    def separate(
+        self,
+        _audio: Path,
+        output_dir: Path,
+        _model: str,
+        _logger: logging.Logger,
+    ) -> tuple[Path, dict[str, object]]:
+        self.calls += 1
+        output_dir.mkdir(parents=True, exist_ok=True)
+        vocals = output_dir / "vocals.wav"
+        vocals.write_bytes(b"vocals")
+        return vocals, {
+            "device_used_gb": 5.0,
+            "device_total_gb": 8.0,
+            "torch_allocated_gb": 1.0,
+        }
+
+
 def make_pipeline(tmp_path: Path, local: FakeLocalPipeline) -> HybridVideoPipeline:
     cuda_python = tmp_path / "python.exe"
     cuda_python.write_bytes(b"fake")
-    return HybridVideoPipeline(
+    pipeline = HybridVideoPipeline(
         local,  # type: ignore[arg-type]
         cuda_python=cuda_python,
         model_dir=tmp_path / "models",
@@ -33,7 +88,13 @@ def make_pipeline(tmp_path: Path, local: FakeLocalPipeline) -> HybridVideoPipeli
         audio_bitrate="192k",
         keep_failed_work=False,
         logger=logging.getLogger("test-hybrid-pipeline"),
+        gpu_workers=1,
+        prepare_threads=2,
+        compose_threads=2,
+        prefetch=2,
     )
+    pipeline._cuda_pool = FakeCudaPool()  # type: ignore[assignment]
+    return pipeline
 
 
 def test_hybrid_pipeline_keeps_cpu_work_local(tmp_path: Path) -> None:
@@ -52,52 +113,32 @@ def test_hybrid_pipeline_keeps_cpu_work_local(tmp_path: Path) -> None:
     assert local.device == "cpu"
 
 
-def test_hybrid_pipeline_streams_cuda_progress(tmp_path: Path, monkeypatch) -> None:
-    events = [
-        EVENT_PREFIX
-        + json.dumps(
-            {
-                "kind": "progress",
-                "status": "separating_vocals",
-                "message": "GPU separating",
-            }
+def test_hybrid_pipeline_runs_three_stages_and_reuses_pool(tmp_path: Path) -> None:
+    local = FakeLocalPipeline()
+    pipeline = make_pipeline(tmp_path, local)
+    progress: list[str] = []
+
+    for index in range(2):
+        source = tmp_path / f"source-{index}.mp4"
+        source.write_bytes(b"source")
+        result = pipeline.process(
+            source,
+            tmp_path / f"output-{index}.mp4",
+            job_id=f"job-{index}",
+            model="mdx",
+            prefer_video_copy=True,
+            device="cuda",
+            progress=lambda status, _message: progress.append(status),
         )
-        + "\n",
-        EVENT_PREFIX
-        + json.dumps(
-            {
-                "kind": "result",
-                "output_video": str(tmp_path / "output.mp4"),
-                "duration_seconds": 2.5,
-                "used_video_copy": True,
-            }
-        )
-        + "\n",
-    ]
+        assert result.used_video_copy is True
 
-    class FakeProcess:
-        stdout = iter(events)
-
-        @staticmethod
-        def wait() -> int:
-            return 0
-
-    monkeypatch.setattr(
-        "app.services.hybrid_pipeline.subprocess.Popen",
-        lambda *args, **kwargs: FakeProcess(),
-    )
-    progress: list[tuple[str, str]] = []
-    pipeline = make_pipeline(tmp_path, FakeLocalPipeline())
-
-    result = pipeline.process(
-        tmp_path / "source.mp4",
-        tmp_path / "output.mp4",
-        job_id="job",
-        model="mdx",
-        prefer_video_copy=True,
-        device="cuda",
-        progress=lambda status, message: progress.append((status, message)),
-    )
-
-    assert progress == [("separating_vocals", "GPU separating")]
-    assert result.duration_seconds == 2.5
+    pool = pipeline._cuda_pool
+    assert isinstance(pool, FakeCudaPool)
+    assert pool.calls == 2
+    assert progress == [
+        "extracting_audio",
+        "separating_vocals",
+        "composing_video",
+        "completed",
+    ] * 2
+    assert pipeline.scheduling_target("cuda", 1) == 5

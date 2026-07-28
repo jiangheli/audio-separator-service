@@ -179,6 +179,14 @@ class BatchRunner:
             )
 
             self._refresh_report()
+            _cpu_workers, gpu_workers = controller.get_allocation()
+            warm_gpu = getattr(self.pipeline, "warm_gpu", None)
+            if jobs and gpu_workers > 0 and callable(warm_gpu):
+                self.logger.info(
+                    "Warming %s persistent CUDA worker(s) before the batch",
+                    gpu_workers,
+                )
+                warm_gpu(gpu_workers)
             outcomes = self._run_jobs(
                 jobs,
                 controller=controller,
@@ -221,6 +229,14 @@ class BatchRunner:
                 cpu_target, gpu_target = controller.get_allocation()
                 active_cpu = sum(device == "cpu" for device in active.values())
                 active_gpu = sum(device == "cuda" for device in active.values())
+                target_resolver = getattr(
+                    self.pipeline,
+                    "scheduling_target",
+                    None,
+                )
+                if callable(target_resolver):
+                    cpu_target = int(target_resolver("cpu", cpu_target))
+                    gpu_target = int(target_resolver("cuda", gpu_target))
                 for device, target, current in (
                     ("cuda", gpu_target, active_gpu),
                     ("cpu", cpu_target, active_cpu),

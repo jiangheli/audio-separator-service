@@ -9,7 +9,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.5.0"
+        default: "1.6.0"
   push:
     tags:
       - "gui-v*"
@@ -122,6 +122,11 @@ jobs:
           }
           if (-not $GetPip -or -not $GpuWorker -or -not $WheelManifest) {
             throw "Offline CUDA installer, manifest, or worker source is missing."
+          }
+          $GpuWorkerSource = Get-Content $GpuWorker.FullName -Raw
+          if ($GpuWorkerSource -notmatch "serve" -or `
+              $GpuWorkerSource -notmatch "load_model") {
+            throw "Persistent CUDA worker source is not packaged."
           }
           if (-not $TorchWheel -or $TorchWheel.Length -lt 3GB) {
             throw "Offline CUDA PyTorch wheel is missing or unexpectedly small."

@@ -25,6 +25,7 @@ class VideoComposer:
         output_video: Path,
         *,
         prefer_stream_copy: bool = True,
+        prefer_nvenc: bool = False,
     ) -> bool:
         output_video.parent.mkdir(parents=True, exist_ok=True)
         temporary = output_video.with_name(
@@ -32,13 +33,35 @@ class VideoComposer:
         )
         try:
             if prefer_stream_copy:
-                copied = self._run(source_video, vocals_audio, temporary, copy_video=True)
+                copied = self._run(
+                    source_video,
+                    vocals_audio,
+                    temporary,
+                    video_mode="copy",
+                )
                 if copied:
                     os.replace(temporary, output_video)
                     return True
                 temporary.unlink(missing_ok=True)
 
-            if not self._run(source_video, vocals_audio, temporary, copy_video=False):
+            if prefer_nvenc:
+                encoded = self._run(
+                    source_video,
+                    vocals_audio,
+                    temporary,
+                    video_mode="nvenc",
+                )
+                if encoded:
+                    os.replace(temporary, output_video)
+                    return False
+                temporary.unlink(missing_ok=True)
+
+            if not self._run(
+                source_video,
+                vocals_audio,
+                temporary,
+                video_mode="cpu",
+            ):
                 raise VideoCompositionError(
                     f"FFmpeg could not compose the vocals-only video "
                     f"{source_video.name}: {self._last_error or 'unknown FFmpeg error'}"
@@ -54,16 +77,28 @@ class VideoComposer:
         vocals_audio: Path,
         temporary: Path,
         *,
-        copy_video: bool,
+        video_mode: str,
     ) -> bool:
-        video_codec = ["-c:v", "copy"] if copy_video else [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-        ]
+        if video_mode == "copy":
+            video_codec = ["-c:v", "copy"]
+        elif video_mode == "nvenc":
+            video_codec = [
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p5",
+                "-cq",
+                "19",
+            ]
+        else:
+            video_codec = [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+            ]
         command = [
             self.ffmpeg_binary,
             "-nostdin",

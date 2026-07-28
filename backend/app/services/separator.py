@@ -59,6 +59,54 @@ class PythonAudioSeparatorEngine:
         device: str = "auto",
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
+        separator = self._separator_for(
+            model,
+            output_dir=output_dir,
+            device=device,
+        )
+        output_files = separator.separate(
+            str(audio_path),
+            custom_output_names={"Vocals": "vocals"},
+        )
+
+        for value in output_files:
+            path = Path(value)
+            if not path.is_absolute():
+                path = output_dir / path
+            if "vocal" in path.stem.lower() and path.is_file():
+                return path.resolve()
+        written_files = sorted(
+            str(path.relative_to(output_dir))
+            for path in output_dir.rglob("*")
+            if path.is_file()
+        )
+        raise VocalSeparationError(
+            f"The model completed but did not produce a vocals stem for "
+            f"{audio_path.name}; returned={output_files!r}; "
+            f"written_files={written_files!r}"
+        )
+
+    def load_model(
+        self,
+        model: str,
+        *,
+        device: str = "auto",
+    ) -> None:
+        """Load and cache a model through the upstream public Python API."""
+        self._separator_for(
+            model,
+            output_dir=self.model_dir / ".stemflow-warmup",
+            device=device,
+        )
+
+    def _separator_for(
+        self,
+        model: str,
+        *,
+        output_dir: Path,
+        device: str,
+    ) -> object:
+        output_dir.mkdir(parents=True, exist_ok=True)
         model_filename = self.resolve_model(model)
         selected_device = device.strip().lower()
         if selected_device not in {"auto", "cpu", "cuda"}:
@@ -102,28 +150,7 @@ class PythonAudioSeparatorEngine:
             model_instance = getattr(separator, "model_instance", None)
             if model_instance is not None:
                 model_instance.output_dir = str(output_dir)
-
-        output_files = separator.separate(
-            str(audio_path),
-            custom_output_names={"Vocals": "vocals"},
-        )
-
-        for value in output_files:
-            path = Path(value)
-            if not path.is_absolute():
-                path = output_dir / path
-            if "vocal" in path.stem.lower() and path.is_file():
-                return path.resolve()
-        written_files = sorted(
-            str(path.relative_to(output_dir))
-            for path in output_dir.rglob("*")
-            if path.is_file()
-        )
-        raise VocalSeparationError(
-            f"The model completed but did not produce a vocals stem for "
-            f"{audio_path.name}; returned={output_files!r}; "
-            f"written_files={written_files!r}"
-        )
+        return separator
 
     def _select_device(self, separator: object, device: str) -> None:
         """Select a public runtime device without changing upstream inference."""

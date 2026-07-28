@@ -37,6 +37,7 @@ class FakeComposer:
         output: Path,
         *,
         prefer_stream_copy: bool,
+        prefer_nvenc: bool = False,
     ) -> bool:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"video-with-vocals")
