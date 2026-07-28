@@ -26,11 +26,26 @@ def test_load_config_resolves_relative_runtime_paths(tmp_path: Path) -> None:
     assert config.database_path == tmp_path / "runtime" / "processing.db"
     assert config.report_path == tmp_path / "runtime" / "processing_status.xlsx"
     assert config.schedule_time == "01:30"
+    assert config.gpu_batch_size == 2
+    assert config.gpu_segment_size == 256
+    assert config.concatenate_by_folder is False
 
 
 def test_rejects_same_input_and_output(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="must be different"):
         ServiceConfig.from_mapping(
             {"input_dir": str(tmp_path), "output_dir": str(tmp_path)},
+            base=tmp_path,
+        )
+
+
+def test_rejects_invalid_gpu_tuning(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="gpu_segment_size"):
+        ServiceConfig.from_mapping(
+            {
+                "input_dir": str(tmp_path / "input"),
+                "output_dir": str(tmp_path / "output"),
+                "gpu_segment_size": 100,
+            },
             base=tmp_path,
         )

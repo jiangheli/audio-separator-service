@@ -99,8 +99,10 @@ def cuda_runtime_active() -> bool:
     return hardware.cuda_available and hardware.cuda_provider_available
 
 
-def gpu_memory_estimate_gb(worker_count: int) -> float:
-    return 1.5 + max(1, worker_count) * 4.0
+def gpu_memory_estimate_gb(worker_count: int, batch_size: int = 1) -> float:
+    workers = max(1, worker_count)
+    batches = max(1, batch_size)
+    return 1.5 + workers * (4.0 + (batches - 1) * 0.8)
 
 
 def recommended_gpu_workers(gpu: NvidiaGpu | None) -> int:

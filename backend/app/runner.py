@@ -17,6 +17,7 @@ from app.services.scanner import (
     output_path_for,
     scan_videos,
 )
+from app.services.concatenator import FolderVideoConcatenator
 from app.services.video_pipeline import VideoBgmRemovalPipeline
 
 
@@ -81,12 +82,15 @@ class BatchRunner:
         pipeline: VideoBgmRemovalPipeline,
         report: ProcessingReport,
         logger: logging.Logger,
+        *,
+        concatenator: FolderVideoConcatenator | None = None,
     ) -> None:
         self.config = config
         self.repository = repository
         self.pipeline = pipeline
         self.report = report
         self.logger = logger
+        self.concatenator = concatenator
         self._report_lock = threading.Lock()
 
     def run_once(
@@ -196,6 +200,49 @@ class BatchRunner:
 
             summary["completed"] = outcomes.count("completed")
             summary["failed"] = outcomes.count("failed")
+            summary["collections_completed"] = 0
+            summary["collections_failed"] = 0
+            if (
+                self.config.concatenate_by_folder
+                and self.concatenator is not None
+                and not (stop_event is not None and stop_event.is_set())
+            ):
+                _cpu_workers, gpu_workers = controller.get_allocation()
+                collections = self.concatenator.concatenate_completed(
+                    self.repository.list_jobs(),
+                    input_root=self.config.input_dir,
+                    output_root=self.config.output_dir,
+                    output_suffix=self.config.output_suffix,
+                    prefer_nvenc=gpu_workers > 0,
+                )
+                for collection in collections:
+                    folder = (
+                        str(collection.folder)
+                        if collection.folder != Path(".")
+                        else self.config.input_dir.name
+                    )
+                    if collection.status == "completed":
+                        summary["collections_completed"] += 1
+                        self.logger.info(
+                            "Collection completed: %s (%s video(s)) -> %s",
+                            folder,
+                            collection.input_count,
+                            collection.output,
+                        )
+                    elif collection.status == "failed":
+                        summary["collections_failed"] += 1
+                        self.logger.error(
+                            "Collection failed: %s (%s video(s)): %s",
+                            folder,
+                            collection.input_count,
+                            collection.error,
+                        )
+                    else:
+                        self.logger.info(
+                            "Collection unchanged: %s -> %s",
+                            folder,
+                            collection.output,
+                        )
 
             summary["counts"] = self.repository.counts()
             self.logger.info(

@@ -142,3 +142,23 @@ def test_hybrid_pipeline_runs_three_stages_and_reuses_pool(tmp_path: Path) -> No
         "completed",
     ] * 2
     assert pipeline.scheduling_target("cuda", 1) == 5
+
+
+def test_cuda_worker_command_contains_gpu_tuning(tmp_path: Path) -> None:
+    from app.services.hybrid_pipeline import PersistentCudaWorker
+
+    worker = PersistentCudaWorker(
+        tmp_path / "python.exe",
+        model_dir=tmp_path / "models",
+        work_root=tmp_path / "work",
+        model="mdx.onnx",
+        cpu_threads=4,
+        batch_size=3,
+        segment_size=256,
+        index=0,
+    )
+
+    command = worker._command()
+
+    assert command[command.index("--batch-size") + 1] == "3"
+    assert command[command.index("--segment-size") + 1] == "256"

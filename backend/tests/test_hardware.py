@@ -28,3 +28,4 @@ def test_detect_nvidia_gpu_reads_nvidia_smi(monkeypatch) -> None:
 def test_gpu_memory_estimate_is_conservative() -> None:
     assert hardware.gpu_memory_estimate_gb(1) == 5.5
     assert hardware.gpu_memory_estimate_gb(3) == 13.5
+    assert hardware.gpu_memory_estimate_gb(1, 2) == 6.3

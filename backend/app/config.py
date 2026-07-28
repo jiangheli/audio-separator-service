@@ -45,6 +45,9 @@ class ServiceConfig:
     gpu_compose_threads: int = 2
     gpu_prefetch: int = 2
     gpu_cpu_threads: int = 4
+    gpu_batch_size: int = 2
+    gpu_segment_size: int = 256
+    concatenate_by_folder: bool = False
 
     @classmethod
     def load(cls, config_path: str | Path) -> "ServiceConfig":
@@ -97,6 +100,9 @@ class ServiceConfig:
             gpu_compose_threads=int(raw.get("gpu_compose_threads", 2)),
             gpu_prefetch=int(raw.get("gpu_prefetch", 2)),
             gpu_cpu_threads=int(raw.get("gpu_cpu_threads", 4)),
+            gpu_batch_size=int(raw.get("gpu_batch_size", 2)),
+            gpu_segment_size=int(raw.get("gpu_segment_size", 256)),
+            concatenate_by_folder=bool(raw.get("concatenate_by_folder", False)),
         )
         config.validate()
         return config
@@ -118,6 +124,16 @@ class ServiceConfig:
             raise ValueError("gpu_prefetch cannot be negative")
         if self.gpu_cpu_threads < 1:
             raise ValueError("gpu_cpu_threads must be at least 1")
+        if self.gpu_batch_size < 1 or self.gpu_batch_size > 32:
+            raise ValueError("gpu_batch_size must be between 1 and 32")
+        if (
+            self.gpu_segment_size < 32
+            or self.gpu_segment_size > 1024
+            or self.gpu_segment_size % 32
+        ):
+            raise ValueError(
+                "gpu_segment_size must be a multiple of 32 between 32 and 1024"
+            )
         if not self.output_suffix or any(char in self.output_suffix for char in '<>:"/\\|?*'):
             raise ValueError("output_suffix contains invalid filename characters")
         if not re.fullmatch(r"\d{2,4}k", self.audio_bitrate):

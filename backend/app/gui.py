@@ -187,6 +187,9 @@ def default_settings() -> dict[str, Any]:
         "gpu_compose_threads": 2,
         "gpu_prefetch": 2,
         "gpu_cpu_threads": 4,
+        "gpu_batch_size": 2,
+        "gpu_segment_size": 256,
+        "concatenate_by_folder": False,
         "cuda_index_url": CUDA_INDEX_URL,
     }
 
@@ -351,6 +354,15 @@ class StemFlowGUI:
         )
         self.gpu_cpu_threads = StringVar(
             value=str(self.settings.get("gpu_cpu_threads", 4))
+        )
+        self.gpu_batch_size = StringVar(
+            value=str(self.settings.get("gpu_batch_size", 2))
+        )
+        self.gpu_segment_size = StringVar(
+            value=str(self.settings.get("gpu_segment_size", 256))
+        )
+        self.concatenate_by_folder = BooleanVar(
+            value=bool(self.settings.get("concatenate_by_folder", False))
         )
         self.schedule_enabled = BooleanVar(
             value=bool(self.settings.get("schedule_enabled", False))
@@ -534,6 +546,8 @@ class StemFlowGUI:
             ("合成", self.gpu_compose_threads, range(1, 9)),
             ("预取", self.gpu_prefetch, range(9)),
             ("GPU辅助CPU", self.gpu_cpu_threads, range(1, 9)),
+            ("GPU批量", self.gpu_batch_size, range(1, 17)),
+            ("GPU分块", self.gpu_segment_size, (32, 64, 128, 256, 512)),
         ):
             ttk.Label(pipeline_frame, text=label).pack(side="left")
             ttk.Combobox(
@@ -569,8 +583,16 @@ class StemFlowGUI:
             command=self._open_cuda_log,
         ).pack(side="left", padx=(8, 0))
 
+        collection_frame = ttk.Frame(settings)
+        collection_frame.grid(row=7, column=1, sticky="w", padx=10, pady=(10, 0))
+        ttk.Checkbutton(
+            collection_frame,
+            text="每个子文件夹处理完成后，各生成一个人声版合集",
+            variable=self.concatenate_by_folder,
+        ).pack(side="left")
+
         schedule_frame = ttk.Frame(settings)
-        schedule_frame.grid(row=7, column=1, sticky="w", padx=10, pady=(10, 0))
+        schedule_frame.grid(row=8, column=1, sticky="w", padx=10, pady=(10, 0))
         ttk.Checkbutton(
             schedule_frame,
             text="每天自动运行",
@@ -586,7 +608,7 @@ class StemFlowGUI:
             settings,
             text="保存定时",
             command=self._save_schedule,
-        ).grid(row=7, column=2, pady=(10, 0))
+        ).grid(row=8, column=2, pady=(10, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=14)
@@ -737,7 +759,13 @@ class StemFlowGUI:
         except ValueError:
             cpu, gpu = 1, 0
         estimate = estimated_memory_gb(cpu + gpu)
-        gpu_estimate = gpu_memory_estimate_gb(gpu) if gpu else 0.0
+        try:
+            gpu_batch_size = max(1, int(self.gpu_batch_size.get()))
+        except ValueError:
+            gpu_batch_size = 1
+        gpu_estimate = (
+            gpu_memory_estimate_gb(gpu, gpu_batch_size) if gpu else 0.0
+        )
         if self.total_memory_gb > 0:
             text = (
                 f"内存：总计 {self.total_memory_gb:.1f} GB，可用 "
@@ -1034,6 +1062,9 @@ class StemFlowGUI:
                 "gpu_compose_threads": int(self.gpu_compose_threads.get()),
                 "gpu_prefetch": int(self.gpu_prefetch.get()),
                 "gpu_cpu_threads": int(self.gpu_cpu_threads.get()),
+                "gpu_batch_size": int(self.gpu_batch_size.get()),
+                "gpu_segment_size": int(self.gpu_segment_size.get()),
+                "concatenate_by_folder": self.concatenate_by_folder.get(),
                 "cuda_index_url": CUDA_INDEX_URL,
                 "schedule_enabled": self.schedule_enabled.get(),
                 "schedule_time": self.schedule_time.get().strip(),
@@ -1100,12 +1131,15 @@ class StemFlowGUI:
         if (
             gpu_workers
             and self.hardware.gpu
-            and gpu_memory_estimate_gb(gpu_workers)
+            and gpu_memory_estimate_gb(
+                gpu_workers,
+                config.gpu_batch_size,
+            )
             > self.hardware.gpu.free_memory_gb
             and not messagebox.askyesno(
                 "显存可能不足",
                 f"{gpu_workers} 个 GPU 并发预计需要约 "
-                f"{gpu_memory_estimate_gb(gpu_workers):.1f} GB 显存，"
+                f"{gpu_memory_estimate_gb(gpu_workers, config.gpu_batch_size):.1f} GB 显存，"
                 f"当前可用约 {self.hardware.gpu.free_memory_gb:.1f} GB。\n\n"
                 "显存不足可能导致当前集失败，仍然继续吗？",
             )

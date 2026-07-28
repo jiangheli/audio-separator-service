@@ -22,6 +22,7 @@ from app.repository import ProcessingRepository
 from app.runner import BatchRunner
 from app.runtime import RuntimeDependencyError, ensure_ffmpeg
 from app.services.composer import VideoComposer
+from app.services.concatenator import FolderVideoConcatenator
 from app.services.extractor import AudioExtractor
 from app.services.hybrid_pipeline import HybridVideoPipeline
 from app.services.separator import PythonAudioSeparatorEngine
@@ -120,9 +121,26 @@ def make_runner(
         compose_threads=config.gpu_compose_threads,
         prefetch=config.gpu_prefetch,
         gpu_cpu_threads=config.gpu_cpu_threads,
+        gpu_batch_size=config.gpu_batch_size,
+        gpu_segment_size=config.gpu_segment_size,
     )
     report = ProcessingReport(config.report_path)
-    return BatchRunner(config, repository, pipeline, report, logger), repository, logger
+    concatenator = FolderVideoConcatenator(
+        ffmpeg,
+        audio_bitrate=config.audio_bitrate,
+    )
+    return (
+        BatchRunner(
+            config,
+            repository,
+            pipeline,
+            report,
+            logger,
+            concatenator=concatenator,
+        ),
+        repository,
+        logger,
+    )
 
 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:

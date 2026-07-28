@@ -11,6 +11,7 @@ from app.models import VideoProcessResult
 from app.report import ProcessingReport
 from app.repository import ProcessingRepository
 from app.runner import BatchRunner, ConcurrencyController
+from app.services.concatenator import ConcatenationResult
 
 
 class FakePipeline:
@@ -308,3 +309,45 @@ def test_runner_expands_cuda_slots_for_pipeline_stages(tmp_path: Path) -> None:
     assert pipeline.warmed == 1
     assert pipeline.max_active >= 3
     assert set(pipeline.devices) == {"cuda"}
+
+
+def test_runner_builds_folder_collections_after_processing(tmp_path: Path) -> None:
+    class FakeConcatenator:
+        def __init__(self) -> None:
+            self.jobs: list[dict[str, object]] = []
+
+        def concatenate_completed(self, jobs, **_options):
+            self.jobs = list(jobs)
+            return [
+                ConcatenationResult(
+                    Path("series"),
+                    tmp_path / "output" / "series" / "series_合集_vocals_only.mp4",
+                    2,
+                    "completed",
+                )
+            ]
+
+    config = make_config(tmp_path)
+    config.concatenate_by_folder = True
+    config.prepare_directories()
+    for index in range(2):
+        source = config.input_dir / "series" / f"episode-{index}.mp4"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"video")
+    repository = ProcessingRepository(config.database_path)
+    concatenator = FakeConcatenator()
+    runner = BatchRunner(
+        config,
+        repository,
+        FakePipeline(),
+        ProcessingReport(config.report_path),
+        logging.getLogger("test-collection-runner"),
+        concatenator=concatenator,  # type: ignore[arg-type]
+    )
+
+    summary = runner.run_once()
+
+    assert summary["completed"] == 2
+    assert summary["collections_completed"] == 1
+    assert summary["collections_failed"] == 0
+    assert len(concatenator.jobs) == 2

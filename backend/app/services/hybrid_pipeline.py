@@ -17,7 +17,10 @@ from app.services.video_pipeline import ProgressCallback, VideoBgmRemovalPipelin
 
 
 EVENT_PREFIX = "STEMFLOW_EVENT\t"
-_WORKER_REGISTRY: dict[tuple[str, str, str, int, int], "PersistentCudaWorker"] = {}
+_WORKER_REGISTRY: dict[
+    tuple[str, str, str, int, int, int, int],
+    "PersistentCudaWorker",
+] = {}
 _WORKER_REGISTRY_LOCK = threading.Lock()
 
 
@@ -32,6 +35,8 @@ class PersistentCudaWorker:
         work_root: Path,
         model: str,
         cpu_threads: int,
+        batch_size: int,
+        segment_size: int,
         index: int,
     ) -> None:
         self.python = python
@@ -39,6 +44,8 @@ class PersistentCudaWorker:
         self.work_root = work_root
         self.model = model
         self.cpu_threads = cpu_threads
+        self.batch_size = batch_size
+        self.segment_size = segment_size
         self.index = index
         self.process: subprocess.Popen[str] | None = None
         self._request_lock = threading.Lock()
@@ -58,6 +65,10 @@ class PersistentCudaWorker:
             str(self.work_root),
             "--cpu-threads",
             str(self.cpu_threads),
+            "--batch-size",
+            str(self.batch_size),
+            "--segment-size",
+            str(self.segment_size),
         ]
 
     def start(self, logger: logging.Logger) -> None:
@@ -87,12 +98,14 @@ class PersistentCudaWorker:
                 )
             logger.info(
                 "CUDA worker %s ready; model=%s; device=%s; providers=%s; "
-                "load=%.1fs; device VRAM=%.2f/%.2fGB",
+                "load=%.1fs; segment=%s; batch=%s; device VRAM=%.2f/%.2fGB",
                 self.index,
                 event.get("model"),
                 event.get("device"),
                 event.get("providers"),
                 float(event.get("load_seconds", 0)),
+                event.get("segment_size"),
+                event.get("batch_size"),
                 float(event.get("device_used_gb", 0)),
                 float(event.get("device_total_gb", 0)),
             )
@@ -208,25 +221,51 @@ class PersistentCudaPool:
         work_root: Path,
         model: str,
         cpu_threads: int,
+        batch_size: int,
+        segment_size: int,
     ) -> None:
         self.python = python
         self.model_dir = model_dir
         self.work_root = work_root
         self.model = model
         self.cpu_threads = cpu_threads
+        self.batch_size = batch_size
+        self.segment_size = segment_size
         self._condition = threading.Condition()
         self._busy: set[int] = set()
         self._size = 1
+        self._retire_incompatible_workers()
 
     def set_size(self, value: int) -> None:
+        close_indices: list[int] = []
         with self._condition:
+            previous = self._size
             self._size = max(1, int(value))
+            if self._size < previous:
+                close_indices = [
+                    index
+                    for index in range(self._size, previous)
+                    if index not in self._busy
+                ]
             self._condition.notify_all()
+        for index in close_indices:
+            self._worker(index).close()
 
     def warm(self, count: int, logger: logging.Logger) -> None:
         self.set_size(count)
         for index in range(max(1, count)):
             self._worker(index).start(logger)
+
+    def _retire_incompatible_workers(self) -> None:
+        prefix = (str(self.python), str(self.model_dir), self.model)
+        expected = (self.cpu_threads, self.batch_size, self.segment_size)
+        retired: list[PersistentCudaWorker] = []
+        with _WORKER_REGISTRY_LOCK:
+            for key in list(_WORKER_REGISTRY):
+                if key[:3] == prefix and key[3:6] != expected:
+                    retired.append(_WORKER_REGISTRY.pop(key))
+        for worker in retired:
+            worker.close()
 
     def _worker(self, index: int) -> PersistentCudaWorker:
         key = (
@@ -234,6 +273,8 @@ class PersistentCudaPool:
             str(self.model_dir),
             self.model,
             self.cpu_threads,
+            self.batch_size,
+            self.segment_size,
             index,
         )
         with _WORKER_REGISTRY_LOCK:
@@ -245,6 +286,8 @@ class PersistentCudaPool:
                     work_root=self.work_root,
                     model=self.model,
                     cpu_threads=self.cpu_threads,
+                    batch_size=self.batch_size,
+                    segment_size=self.segment_size,
                     index=index,
                 )
                 _WORKER_REGISTRY[key] = worker
@@ -279,9 +322,13 @@ class PersistentCudaPool:
                 logger,
             )
         finally:
+            should_close = False
             with self._condition:
                 self._busy.remove(available)
+                should_close = available >= self._size
                 self._condition.notify()
+            if should_close:
+                self._worker(available).close()
 
 
 class HybridVideoPipeline:
@@ -302,6 +349,8 @@ class HybridVideoPipeline:
         compose_threads: int = 2,
         prefetch: int = 2,
         gpu_cpu_threads: int = 4,
+        gpu_batch_size: int = 2,
+        gpu_segment_size: int = 256,
     ) -> None:
         self.local_pipeline = local_pipeline
         self.cuda_python = cuda_python
@@ -326,6 +375,8 @@ class HybridVideoPipeline:
                 work_root=work_root,
                 model=local_pipeline.separator.default_model,
                 cpu_threads=max(1, gpu_cpu_threads),
+                batch_size=max(1, gpu_batch_size),
+                segment_size=max(32, gpu_segment_size),
             )
             if cuda_python is not None
             else None
@@ -424,13 +475,16 @@ class HybridVideoPipeline:
                 )
                 inference_seconds = time.monotonic() - stage_started
                 self.logger.info(
-                "%s | CUDA inference %.1fs; device VRAM=%s/%sGB; "
-                "PyTorch allocated=%sGB",
-                source_video.name,
-                inference_seconds,
-                metrics.get("device_used_gb", "?"),
-                metrics.get("device_total_gb", "?"),
-                metrics.get("torch_allocated_gb", "?"),
+                    "%s | CUDA inference %.1fs; GPU utilization avg/peak=%s/%s%%; "
+                    "device VRAM=%s/%sGB; PyTorch peak allocated/reserved=%s/%sGB",
+                    source_video.name,
+                    inference_seconds,
+                    metrics.get("gpu_utilization_avg", "?"),
+                    metrics.get("gpu_utilization_peak", "?"),
+                    metrics.get("device_used_gb", "?"),
+                    metrics.get("device_total_gb", "?"),
+                    metrics.get("torch_peak_allocated_gb", "?"),
+                    metrics.get("torch_peak_reserved_gb", "?"),
                 )
 
             if progress:

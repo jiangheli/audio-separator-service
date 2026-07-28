@@ -10,5 +10,8 @@
   "audio_bitrate": "192k",
   "recursive": true,
   "keep_failed_work": false,
-  "video_copy": true
+  "video_copy": true,
+  "gpu_batch_size": 2,
+  "gpu_segment_size": 256,
+  "concatenate_by_folder": false
 }

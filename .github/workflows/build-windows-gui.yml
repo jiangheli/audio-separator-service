@@ -9,7 +9,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.6.0"
+        default: "1.7.0"
   push:
     tags:
       - "gui-v*"
@@ -212,6 +212,12 @@ jobs:
           @"
           ## StemFlow $Version
 
+          ### 本版功能
+
+          - CUDA 模型常驻，MDX 原生 256 分块，并支持可调 GPU 批量；
+          - 日志显示 GPU 平均/峰值利用率与峰值显存；
+          - 可选按输入子文件夹分别生成人声版合集，同时保留全部单集。
+
           ### 新用户：完整内置 GPU 版
 
           下载 `StemFlow-Setup-$Version-x64.exe` 和全部同名 `.bin` 分卷，
@@ -237,7 +243,13 @@ jobs:
             Get-ChildItem .\dist\update\StemFlow-Update-*-x64.exe.sha256 -File
           ) | ForEach-Object { $_.FullName }
 
-          if (gh release view $env:GITHUB_REF_NAME 2>$null) {
+          $SavedErrorAction = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          gh release view $env:GITHUB_REF_NAME *> $null
+          $ReleaseExists = $LASTEXITCODE -eq 0
+          $ErrorActionPreference = $SavedErrorAction
+
+          if ($ReleaseExists) {
             gh release upload $env:GITHUB_REF_NAME $Assets --clobber
           } else {
             gh release create $env:GITHUB_REF_NAME $Assets `

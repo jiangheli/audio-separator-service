@@ -31,6 +31,7 @@ class PythonAudioSeparatorEngine:
         default_model: str = DEFAULT_MODEL,
         mdx_segment_size: int = 32,
         mdxc_segment_size: int = 256,
+        batch_size: int = 1,
         log_level: int = logging.INFO,
     ) -> None:
         self.model_dir = model_dir
@@ -40,6 +41,7 @@ class PythonAudioSeparatorEngine:
         )
         self.mdx_segment_size = mdx_segment_size
         self.mdxc_segment_size = mdxc_segment_size
+        self.batch_size = max(1, int(batch_size))
         self.log_level = log_level
         self.logger = logging.getLogger("stemflow_video")
         self._thread_local = threading.local()
@@ -131,13 +133,13 @@ class PythonAudioSeparatorEngine:
                     "hop_length": 1024,
                     "segment_size": self.mdx_segment_size,
                     "overlap": 0.25,
-                    "batch_size": 1,
+                    "batch_size": self.batch_size,
                     "enable_denoise": False,
                 },
                 mdxc_params={
                     "segment_size": self.mdxc_segment_size,
                     "override_model_segment_size": True,
-                    "batch_size": 1,
+                    "batch_size": self.batch_size,
                     "overlap": 8,
                     "pitch_shift": 0,
                 },

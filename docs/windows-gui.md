@@ -20,6 +20,18 @@ Windows GUI 版面向不需要接触 Python、PowerShell、Web 或命令行的�
 
 最终视频保留原画面，只使用 AI 分离后的人声音轨，不生成 BGM WAV。
 
+勾选“每个子文件夹处理完成后，各生成一个人声版合集”时，单集文件仍会保留，
+并在每个原始视频所在的子文件夹对应输出目录中增加：
+
+```text
+子文件夹名_合集_vocals_only.mp4
+```
+
+各子文件夹独立合并，按文件名中的数字自然排序（例如第 2 集排在第 10 集前）。
+失败的单集会跳过并写入日志，不会混入其他子文件夹的合集。输入根目录中直接存放的
+视频使用输入根目录名称生成一个根目录合集。已存在且所有输入都未变化的合集不会
+重复构建。
+
 ## CPU、GPU、混合运行与实时并发
 
 “运行设备”提供三种模式：
@@ -38,7 +50,8 @@ CPU 和 GPU 都可以直接输入任意非负整数，不设固定上限。单�
 GPU 模式启动批次时会先启动长期运行的 CUDA worker，通过
 `python-audio-separator` 的公开 Python API 加载一次模型。后续视频复用同一个
 进程和模型，不再重复导入 PyTorch、初始化 CUDA 或加载 ONNX 模型。运行日志会
-记录 CUDA Provider、显卡名称、模型加载时间、整卡显存使用量和每条推理耗时。
+记录 CUDA Provider、显卡名称、模型加载时间、整卡显存使用量、每条推理耗时，
+以及 GPU 平均/峰值利用率和 PyTorch 峰值显存。
 
 GPU 视频采用有界三级流水线：
 
@@ -51,8 +64,16 @@ CPU 视频合成（默认 2）
 ```
 
 最多提前准备 2 条音频，避免任务缓存无限占用内存。GUI 的“GPU 流水线”可调整
-预处理线程、合成线程、预取数量和 GPU 辅助 CPU 线程。RTX 4060/5060 Ti 8 GB
-建议从 `CPU模型 0、GPU 1、预处理 2、合成 2、预取 2、GPU辅助CPU 4` 开始。
+预处理线程、合成线程、预取数量、GPU 辅助 CPU 线程、GPU 批量和 GPU 分块。
+GPU 路径默认采用模型原生的 MDX 分块 `256`，避免分块不匹配触发 ONNX 转
+PyTorch 慢路径；默认批量为 `2`，同一轮推理处理更多音频块。RTX 4060/5060 Ti
+8 GB 建议从
+`CPU模型 0、GPU 1、预处理 2、合成 2、预取 2、GPU辅助CPU 4、批量 2、分块 256`
+开始。
+
+如果日志显示显存仍有明显余量且 GPU 平均利用率偏低，可先把“GPU 批量”提高到
+`3` 或 `4`；若出现 CUDA out of memory，则退回 `1` 或 `2`。8 GB 显卡通常保持
+GPU worker 为 `1`，优先调批量而不是同时加载多个模型。
 
 人声合成首先使用 `-c:v copy` 直接复制原画面，不重新编码、不损失画质。源视频
 无法直接封装时，GPU 模式先尝试 `h264_nvenc`，不可用时再回退 `libx264`。
@@ -204,17 +225,17 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.6.0"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.7.0"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.6.0-x64.exe
-dist\installer\StemFlow-Setup-1.6.0-x64-1.bin
-dist\installer\StemFlow-Setup-1.6.0-x64-2.bin
-dist\update\StemFlow-Update-1.6.0-x64.exe
-dist\update\StemFlow-Update-1.6.0-x64.exe.sha256
+dist\installer\StemFlow-Setup-1.7.0-x64.exe
+dist\installer\StemFlow-Setup-1.7.0-x64-1.bin
+dist\installer\StemFlow-Setup-1.7.0-x64-2.bin
+dist\update\StemFlow-Update-1.7.0-x64.exe
+dist\update\StemFlow-Update-1.7.0-x64.exe.sha256
 ```
 
 也可以推送 `gui-v<版本>` 标签触发 GitHub Actions。标签构建成功后会自动创建
