@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Version = "1.3.0",
+    [string]$Version = "1.4.0",
     [switch]$SkipDependencyInstall,
     [switch]$SkipAssetDownload
 )
@@ -24,6 +24,10 @@ if (-not $SkipDependencyInstall) {
 if (-not $SkipAssetDownload) {
     & (Join-Path $PSScriptRoot "download-bundle-assets.ps1")
 }
+# The CUDA wheelhouse itself is retained under packaging/windows/bundle.
+# Clearing pip's download cache avoids keeping a second multi-gigabyte copy
+# while PyInstaller and Inno Setup create their own build outputs.
+python -m pip cache purge | Out-Null
 
 python $IconScript
 python -m PyInstaller --noconfirm --clean `
@@ -53,4 +57,18 @@ $Installer = Join-Path $ProjectRoot "dist\installer\StemFlow-Setup-$Version-x64.
 if (-not (Test-Path $Installer)) {
     throw "Installer was not created: $Installer"
 }
-Write-Host "Installer ready: $Installer" -ForegroundColor Green
+$InstallerParts = @(
+    Get-ChildItem (Join-Path $ProjectRoot "dist\installer") `
+        -Filter "StemFlow-Setup-$Version-x64*" -File
+)
+if ($InstallerParts.Count -lt 2) {
+    throw "Offline GPU installer did not create disk-spanning BIN files."
+}
+$InstallerBytes = ($InstallerParts | Measure-Object Length -Sum).Sum
+if ($InstallerBytes -lt 3GB) {
+    throw "Offline GPU installer is unexpectedly small: $InstallerBytes bytes"
+}
+Write-Host "Offline GPU installer ready:" -ForegroundColor Green
+$InstallerParts | ForEach-Object {
+    Write-Host "  $($_.FullName) ($($_.Length) bytes)"
+}

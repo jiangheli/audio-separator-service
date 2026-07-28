@@ -22,6 +22,7 @@ from app.gpu_runtime import (
     CUDA_INDEX_URL,
     cuda_runtime_available,
     install_cuda_runtime,
+    offline_wheelhouse,
     read_marker,
     runtime_ready,
 )
@@ -434,7 +435,7 @@ class StemFlowGUI:
 
         self.install_cuda_button = ttk.Button(
             settings,
-            text="安装 CUDA 加速",
+            text="启用内置 CUDA",
             command=self._install_cuda,
         )
         self.install_cuda_button.grid(row=2, column=2, pady=(10, 0))
@@ -484,7 +485,7 @@ class StemFlowGUI:
 
         cuda_link = ttk.Frame(settings)
         cuda_link.grid(row=5, column=1, sticky="w", padx=10, pady=(6, 0))
-        ttk.Label(cuda_link, text="CUDA 下载地址：").pack(side="left")
+        ttk.Label(cuda_link, text="内置 CUDA 来源：").pack(side="left")
         ttk.Label(
             cuda_link,
             textvariable=self.cuda_url_var,
@@ -691,7 +692,7 @@ class StemFlowGUI:
             text=(
                 "CUDA 已安装"
                 if self.cuda_ready
-                else "安装 CUDA 加速"
+                else "启用内置 CUDA"
             ),
             state=(
                 "disabled"
@@ -715,15 +716,22 @@ class StemFlowGUI:
                 "请先正确安装 NVIDIA 驱动。",
             )
             return
+        if offline_wheelhouse() is None:
+            messagebox.showerror(
+                "CUDA 离线资源缺失",
+                "当前安装包没有包含 CUDA PyTorch 离线资源。"
+                "请使用 StemFlow 完整离线 GPU 安装套件重新安装。",
+            )
+            return
         if not messagebox.askyesno(
-            "安装 NVIDIA CUDA 加速",
-            "将从以下官方地址下载约 3 GB 的 CUDA PyTorch 组件：\n\n"
-            f"{CUDA_INDEX_URL}\n\n"
-            "安装后预计占用 7–10 GB 磁盘空间。是否继续？",
+            "启用内置 NVIDIA CUDA 加速",
+            "安装套件已包含兼容的 CUDA PyTorch 组件，启用过程无需联网。\n\n"
+            f"组件官方来源：{CUDA_INDEX_URL}\n\n"
+            "解压安装后预计占用 7–10 GB 磁盘空间。是否继续？",
         ):
             return
         self.install_cuda_button.configure(state="disabled", text="正在安装…")
-        self.status_var.set("正在下载并安装 CUDA 加速组件")
+        self.status_var.set("正在校验并安装内置 CUDA 加速组件")
         self.runtime_installer = threading.Thread(
             target=self._run_cuda_install,
             daemon=True,
@@ -819,7 +827,7 @@ class StemFlowGUI:
         if gpu_workers and not self.cuda_ready:
             messagebox.showwarning(
                 "CUDA 尚未启用",
-                "当前选择需要 NVIDIA GPU。请先点击“安装 CUDA 加速”，"
+                "当前选择需要 NVIDIA GPU。请先点击“启用内置 CUDA”，"
                 "安装验证成功后再开始。",
             )
             return
@@ -928,7 +936,7 @@ class StemFlowGUI:
                     self.status_var.set("CUDA 安装失败，继续使用 CPU")
                     self.install_cuda_button.configure(
                         state="normal",
-                        text="重新安装 CUDA",
+                        text="重新启用 CUDA",
                     )
                     self._append_log(str(payload))
                     messagebox.showerror(

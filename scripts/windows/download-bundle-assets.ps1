@@ -12,8 +12,9 @@ if ([string]::IsNullOrWhiteSpace($Destination)) {
 }
 $ModelDirectory = Join-Path $Destination "models"
 $GpuBootstrapDirectory = Join-Path $Destination "gpu-bootstrap"
+$WheelhouseDirectory = Join-Path $GpuBootstrapDirectory "wheelhouse"
 New-Item -ItemType Directory -Force `
-    -Path $ModelDirectory, $GpuBootstrapDirectory | Out-Null
+    -Path $ModelDirectory, $GpuBootstrapDirectory, $WheelhouseDirectory | Out-Null
 
 function Get-Asset {
     param(
@@ -71,6 +72,71 @@ Get-Asset `
     -Uri "https://bootstrap.pypa.io/get-pip.py" `
     -Output (Join-Path $GpuBootstrapDirectory "get-pip.py") `
     -MinimumBytes 1000000
+
+$WheelhouseManifest = Join-Path $WheelhouseDirectory "wheelhouse-manifest.json"
+$RequiredTorchWheel = Get-ChildItem $WheelhouseDirectory `
+    -Filter "torch-2.7.1+cu128-cp312-cp312-win_amd64.whl" `
+    -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if (-not $RequiredTorchWheel -or -not (Test-Path $WheelhouseManifest)) {
+    Write-Host "Downloading complete offline CUDA PyTorch wheelhouse..." `
+        -ForegroundColor Cyan
+    Get-ChildItem $WheelhouseDirectory -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+    python -m pip download `
+        --dest $WheelhouseDirectory `
+        --only-binary=:all: `
+        --index-url "https://download.pytorch.org/whl/cu128" `
+        --extra-index-url "https://pypi.org/simple" `
+        "pip==25.1.1" `
+        "setuptools>=75,<81" `
+        "wheel>=0.45,<1" `
+        "torch==2.7.1+cu128" `
+        "torchvision==0.22.1+cu128" `
+        "torchaudio==2.7.1+cu128" `
+        "audio-separator>=0.44.5,<0.45" `
+        "imageio-ffmpeg>=0.6,<1" `
+        "onnxruntime-gpu>=1.21,<1.23" `
+        "XlsxWriter>=3.2,<4"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not download the offline CUDA PyTorch wheelhouse."
+    }
+
+    $WheelFiles = @(
+        Get-ChildItem $WheelhouseDirectory -Filter "*.whl" -File |
+            Sort-Object Name |
+            ForEach-Object {
+                @{
+                    name = $_.Name
+                    size = $_.Length
+                    sha256 = (
+                        Get-FileHash $_.FullName -Algorithm SHA256
+                    ).Hash.ToLowerInvariant()
+                }
+            }
+    )
+    if ($WheelFiles.Count -lt 10) {
+        throw "Offline CUDA wheelhouse is unexpectedly incomplete."
+    }
+    @{
+        format_version = 1
+        created_at = [DateTime]::UtcNow.ToString("o")
+        python = "3.12"
+        platform = "win_amd64"
+        cuda = "cu128"
+        torch = "2.7.1"
+        files = $WheelFiles
+    } | ConvertTo-Json -Depth 5 |
+        Set-Content -Path $WheelhouseManifest -Encoding UTF8
+}
+
+$OfflineSize = (
+    Get-ChildItem $WheelhouseDirectory -Filter "*.whl" -File |
+        Measure-Object -Property Length -Sum
+).Sum
+if ($OfflineSize -lt 3GB) {
+    throw "Offline CUDA wheelhouse is unexpectedly small: $OfflineSize bytes"
+}
 
 $PythonArchive = Join-Path $GpuBootstrapDirectory "python-3.12.10-embed-amd64.zip"
 $ExpectedPythonSha256 = "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3"

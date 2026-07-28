@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "1.3.0"
+  #define AppVersion "1.4.0"
 #endif
 
 #define AppName "StemFlow 视频纯人声工具"
@@ -21,6 +21,9 @@ SetupIconFile=bundle\stemflow.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/max
 SolidCompression=yes
+DiskSpanning=yes
+DiskSliceSize=1900000000
+SlicesPerDisk=1
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible

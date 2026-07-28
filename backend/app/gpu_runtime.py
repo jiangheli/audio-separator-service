@@ -24,9 +24,18 @@ PYTHON_EMBED_SHA256 = (
 TORCH_VERSION = "2.7.1"
 TORCHVISION_VERSION = "0.22.1"
 TORCHAUDIO_VERSION = "2.7.1"
-GPU_RUNTIME_VERSION = "1"
+GPU_RUNTIME_VERSION = "2"
+OFFLINE_MANIFEST_NAME = "wheelhouse-manifest.json"
 
 LogCallback = Callable[[str], None]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def program_data_dir() -> Path:
@@ -67,6 +76,45 @@ def runtime_ready() -> bool:
         return value.get("runtime_version") == GPU_RUNTIME_VERSION
     except (json.JSONDecodeError, OSError):
         return False
+
+
+def offline_wheelhouse() -> Path | None:
+    wheelhouse = bundled_root() / "gpu-bootstrap" / "wheelhouse"
+    manifest = wheelhouse / OFFLINE_MANIFEST_NAME
+    if wheelhouse.is_dir() and manifest.is_file():
+        return wheelhouse
+    return None
+
+
+def verify_offline_wheelhouse(wheelhouse: Path) -> dict[str, Any]:
+    manifest_path = wheelhouse / OFFLINE_MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"CUDA 离线资源清单缺失：{manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(f"CUDA 离线资源清单无效：{error}") from error
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("CUDA 离线资源清单未包含 wheel 文件")
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise RuntimeError("CUDA 离线资源清单格式无效")
+        name = str(entry.get("name", ""))
+        expected = str(entry.get("sha256", "")).lower()
+        expected_size = int(entry.get("size", 0))
+        path = wheelhouse / name
+        if (
+            not name
+            or not expected
+            or not path.is_file()
+            or path.stat().st_size != expected_size
+        ):
+            raise RuntimeError(f"CUDA 离线资源缺失或大小错误：{name}")
+        actual = _sha256_file(path)
+        if actual != expected:
+            raise RuntimeError(f"CUDA 离线资源校验失败：{name}")
+    return manifest
 
 
 def read_marker() -> dict[str, Any]:
@@ -117,15 +165,23 @@ def _enable_site_packages(python_dir: Path) -> None:
 
 
 def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
-    """Install an isolated CUDA runtime next to persistent StemFlow data."""
+    """Install the bundled isolated CUDA runtime without network access."""
     assets = bundled_root() / "gpu-bootstrap"
     python_archive = assets / "python-3.12.10-embed-amd64.zip"
     get_pip = assets / "get-pip.py"
     app_source = assets / "stemflow" / "app"
-    for required in (python_archive, get_pip, app_source):
+    wheelhouse = offline_wheelhouse()
+    if wheelhouse is None:
+        raise FileNotFoundError("安装包未包含 CUDA PyTorch 离线 wheelhouse")
+    for required in (python_archive, get_pip, app_source, wheelhouse):
         if not required.exists():
             raise FileNotFoundError(f"安装资源缺失：{required}")
-    digest = hashlib.sha256(python_archive.read_bytes()).hexdigest()
+    manifest = verify_offline_wheelhouse(wheelhouse)
+    log(
+        "CUDA PyTorch 离线资源校验通过："
+        f"{len(manifest['files'])} 个 wheel，安装过程无需联网。"
+    )
+    digest = _sha256_file(python_archive)
     if digest != PYTHON_EMBED_SHA256:
         raise RuntimeError(f"Python 安装资源校验失败：{digest}")
     log(f"Python 安装资源 SHA256 校验通过：{digest}")
@@ -145,21 +201,17 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
     python = runtime_python()
     if not python.is_file():
         raise RuntimeError("Python CUDA 运行环境安装后未找到 python.exe")
-    _run_stream([str(python), str(get_pip), "--disable-pip-version-check"], log)
+    offline_args = [
+        "--no-index",
+        "--find-links",
+        str(wheelhouse),
+    ]
     _run_stream(
         [
             str(python),
-            "-m",
-            "pip",
-            "install",
+            str(get_pip),
             "--disable-pip-version-check",
-            f"torch=={TORCH_VERSION}+cu128",
-            f"torchvision=={TORCHVISION_VERSION}+cu128",
-            f"torchaudio=={TORCHAUDIO_VERSION}+cu128",
-            "--index-url",
-            CUDA_INDEX_URL,
-            "--extra-index-url",
-            "https://pypi.org/simple",
+            *offline_args,
         ],
         log,
     )
@@ -170,6 +222,10 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
             "pip",
             "install",
             "--disable-pip-version-check",
+            *offline_args,
+            f"torch=={TORCH_VERSION}+cu128",
+            f"torchvision=={TORCHVISION_VERSION}+cu128",
+            f"torchaudio=={TORCHAUDIO_VERSION}+cu128",
             "audio-separator>=0.44.5,<0.45",
             "imageio-ffmpeg>=0.6,<1",
             "onnxruntime-gpu>=1.21,<1.23",
@@ -202,6 +258,8 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
         "installed_at": datetime.now(timezone.utc).isoformat(),
         "cuda_index_url": CUDA_INDEX_URL,
         "torch_version": TORCH_VERSION,
+        "install_source": "bundled-offline-wheelhouse",
+        "wheelhouse_created_at": manifest.get("created_at", ""),
         "python_source": PYTHON_EMBED_URL,
         "python_sha256": PYTHON_EMBED_SHA256,
     }

@@ -6,7 +6,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.3.0"
+        default: "1.4.0"
   push:
     tags:
       - "gui-v*"
@@ -14,7 +14,7 @@ on:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       APP_VERSION: ${{ inputs.version || github.ref_name }}
 
@@ -96,7 +96,7 @@ jobs:
           }
           & $Ffmpeg -hide_banner -loglevel error -i $Output -f null NUL
 
-      - name: Verify CUDA bootstrap assets
+      - name: Verify offline CUDA PyTorch assets
         shell: powershell
         run: |
           $PythonBootstrap = Get-ChildItem .\dist\StemFlow -Recurse `
@@ -108,11 +108,20 @@ jobs:
           $GpuWorker = Get-ChildItem .\dist\StemFlow -Recurse `
             -Filter "gpu_worker.py" |
             Select-Object -First 1
+          $TorchWheel = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "torch-2.7.1+cu128-cp312-cp312-win_amd64.whl" |
+            Select-Object -First 1
+          $WheelManifest = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "wheelhouse-manifest.json" |
+            Select-Object -First 1
           if (-not $PythonBootstrap -or $PythonBootstrap.Length -lt 10MB) {
             throw "Embedded Python CUDA bootstrap is missing."
           }
-          if (-not $GetPip -or -not $GpuWorker) {
-            throw "CUDA installer or worker source is missing."
+          if (-not $GetPip -or -not $GpuWorker -or -not $WheelManifest) {
+            throw "Offline CUDA installer, manifest, or worker source is missing."
+          }
+          if (-not $TorchWheel -or $TorchWheel.Length -lt 3GB) {
+            throw "Offline CUDA PyTorch wheel is missing or unexpectedly small."
           }
 
       - name: Verify installer
@@ -120,15 +129,26 @@ jobs:
         run: |
           $Installer = Get-ChildItem .\dist\installer\StemFlow-Setup-*-x64.exe |
             Select-Object -First 1
-          if (-not $Installer -or $Installer.Length -lt 100MB) {
-            throw "Installer is missing or unexpectedly small."
+          $InstallerParts = @(Get-ChildItem `
+            .\dist\installer\StemFlow-Setup-*-x64* -File)
+          $TotalBytes = ($InstallerParts | Measure-Object Length -Sum).Sum
+          if (-not $Installer -or $InstallerParts.Count -lt 2) {
+            throw "Disk-spanning offline GPU installer is incomplete."
           }
-          Get-FileHash $Installer.FullName -Algorithm SHA256
+          if ($TotalBytes -lt 3GB) {
+            throw "Offline GPU installer is unexpectedly small."
+          }
+          foreach ($Part in $InstallerParts) {
+            if ($Part.Length -gt 2GB) {
+              throw "Installer part exceeds GitHub Release limit: $($Part.Name)"
+            }
+            Get-FileHash $Part.FullName -Algorithm SHA256
+          }
 
       - uses: actions/upload-artifact@v4
         with:
           name: StemFlow-Windows-GUI-${{ env.APP_VERSION }}
-          path: dist/installer/StemFlow-Setup-*-x64.exe
+          path: dist/installer/StemFlow-Setup-*-x64*
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

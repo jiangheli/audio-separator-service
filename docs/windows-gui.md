@@ -61,23 +61,24 @@ GUI 会读取 Windows 当前的物理内存总量、可用内存和 CPU 核心�
 状态持续写入 SQLite，阶段与错误写入滚动日志，并同步更新 Excel 报表。关闭 GUI
 后重新打开，历史成功和失败记录仍然存在。
 
-## 按需安装 NVIDIA CUDA
+## 离线启用 NVIDIA CUDA
 
-基础安装包自带 CPU 环境。检测到 NVIDIA 显卡后，可以在 GUI 点击“安装 CUDA
-加速”，从以下官方地址下载 CUDA PyTorch：
+完整离线安装套件同时包含 CPU 环境和兼容的 CUDA PyTorch wheelhouse。检测到
+NVIDIA 显卡后，在 GUI 点击“启用内置 CUDA”，程序会校验安装包内每个 wheel 的
+SHA-256，再解压到独立运行环境；整个过程不需要联网。内置组件来自以下官方地址：
 
 ```text
 https://download.pytorch.org/whl/cu128
 ```
 
-地址会显示在界面中并可复制。CUDA 组件约需下载 3 GB，安装后约占用 7–10 GB，
+地址会显示在界面中并可复制。CUDA 离线资源约 3.3 GB，安装后约占用 7–10 GB，
 独立存放在：
 
 ```text
 %ProgramData%\StemFlow\gpu-runtime
 ```
 
-下载、安装和验证过程实时显示，并持久记录在：
+校验、安装和验证过程实时显示，并持久记录在：
 
 ```text
 %ProgramData%\StemFlow\logs\cuda-install.log
@@ -95,9 +96,14 @@ CUDA 安装失败不会破坏 CPU 环境。GPU 任务使用独立 CUDA worker �
 - `UVR-MDX-NET-Inst_HQ_3.onnx` 默认模型及模型参数；
 - Microsoft Visual C++ 2015–2022 x64 运行库安装程序；
 - GUI、SQLite 状态库、Excel 报告和日志功能；
-- CUDA 运行环境安装器与官方下载入口。
+- 完整 CUDA 12.8 PyTorch、TorchAudio、TorchVision、ONNX Runtime GPU 离线
+  wheelhouse，以及官方下载来源说明。
 
-安装后首次启动不需要再安装 Python，也不需要下载默认模型。
+安装后首次启动不需要再安装 Python、下载默认模型或下载 CUDA PyTorch。
+
+由于官方 CUDA PyTorch wheel 单文件已超过 3 GB，而 GitHub Release 单文件上限为
+2 GiB，完整离线套件由一个 `StemFlow-Setup-*-x64.exe` 和若干同名 `.bin` 分卷
+组成。必须把 EXE 和全部 BIN 文件放在同一文件夹，再双击 EXE 安装。
 
 ## 定时任务
 
@@ -138,13 +144,15 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.3.0"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.4.0"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.3.0-x64.exe
+dist\installer\StemFlow-Setup-1.4.0-x64.exe
+dist\installer\StemFlow-Setup-1.4.0-x64-1.bin
+dist\installer\StemFlow-Setup-1.4.0-x64-2.bin
 ```
 
 也可以手动触发 GitHub Actions 的 `Build Windows GUI installer` 工作流。
