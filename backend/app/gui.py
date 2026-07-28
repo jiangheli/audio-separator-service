@@ -20,6 +20,7 @@ from app.cli.main import make_runner
 from app.config import ServiceConfig
 from app.gpu_runtime import (
     CUDA_INDEX_URL,
+    cuda_install_preflight,
     cuda_runtime_available,
     install_cuda_runtime,
     offline_wheelhouse,
@@ -496,6 +497,11 @@ class StemFlowGUI:
             text="复制",
             command=self._copy_cuda_url,
         ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            cuda_link,
+            text="打开 CUDA 日志",
+            command=self._open_cuda_log,
+        ).pack(side="left", padx=(8, 0))
 
         schedule_frame = ttk.Frame(settings)
         schedule_frame.grid(row=6, column=1, sticky="w", padx=10, pady=(10, 0))
@@ -706,6 +712,48 @@ class StemFlowGUI:
         self.root.clipboard_append(self.cuda_url_var.get())
         self.status_var.set("CUDA 下载地址已复制")
 
+    @staticmethod
+    def _cuda_log_path() -> Path:
+        return program_data_dir() / "logs" / "cuda-install.log"
+
+    def _open_cuda_log(self) -> None:
+        path = self._cuda_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["open", str(path)])
+        except OSError as error:
+            messagebox.showerror("无法打开日志", f"{path}\n\n{error}")
+
+    def _cuda_log_tail(self, line_count: int = 14) -> str:
+        path = self._cuda_log_path()
+        if not path.is_file():
+            return "CUDA 日志尚未生成。"
+        try:
+            lines = path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines()
+            return "\n".join(lines[-line_count:])
+        except OSError as error:
+            return f"无法读取 CUDA 日志：{error}"
+
+    @staticmethod
+    def _cuda_error_advice(error: str) -> str:
+        lowered = error.lower()
+        if "驱动" in error or "driver" in lowered:
+            return "请更新 NVIDIA 官方驱动、重启 Windows，再重新启用。"
+        if "空间" in error or "disk" in lowered or "no space" in lowered:
+            return "请释放 CUDA 运行磁盘空间，至少保留 12 GB，再重试。"
+        if "access" in lowered or "permission" in lowered or "拒绝访问" in error:
+            return "请关闭 StemFlow 后以管理员身份启动一次，再重新启用。"
+        if "校验失败" in error or "资源缺失" in error:
+            return "离线安装资源不完整，请确认 EXE 与全部 BIN 同目录后重新安装。"
+        return "不需要手工解压。可点击“重新启用 CUDA”，程序会清理临时目录后重试。"
+
     def _install_cuda(self) -> None:
         if self.runtime_installer and self.runtime_installer.is_alive():
             return
@@ -723,9 +771,21 @@ class StemFlowGUI:
                 "请使用 StemFlow 完整离线 GPU 安装套件重新安装。",
             )
             return
+        try:
+            preflight = cuda_install_preflight()
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+            messagebox.showerror(
+                "CUDA 启用前检查失败",
+                f"{detail}\n\n{self._cuda_error_advice(detail)}",
+            )
+            return
         if not messagebox.askyesno(
             "启用内置 NVIDIA CUDA 加速",
             "安装套件已包含兼容的 CUDA PyTorch 组件，启用过程无需联网。\n\n"
+            f"显卡：{preflight['gpu_name']}\n"
+            f"驱动：{preflight['driver_version']}\n"
+            f"运行磁盘可用：{preflight['free_disk_gb']:.1f} GB\n\n"
             f"组件官方来源：{CUDA_INDEX_URL}\n\n"
             "解压安装后预计占用 7–10 GB 磁盘空间。是否继续？",
         ):
@@ -740,14 +800,14 @@ class StemFlowGUI:
         self.runtime_installer.start()
 
     def _run_cuda_install(self) -> None:
-        log_path = program_data_dir() / "logs" / "cuda-install.log"
+        log_path = self._cuda_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         def record(line: str) -> None:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with log_path.open("a", encoding="utf-8") as stream:
                 stream.write(f"{timestamp} | {line}\n")
-            self.events.put(("log", f"CUDA | {line}"))
+            self.events.put(("cuda-progress", line))
 
         try:
             install_cuda_runtime(record)
@@ -914,6 +974,10 @@ class StemFlowGUI:
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
                     self._append_log(str(payload))
+                elif kind == "cuda-progress":
+                    line = str(payload)
+                    self.status_var.set(line)
+                    self._append_log(f"CUDA | {line}")
                 elif kind == "refresh":
                     self._refresh_jobs()
                 elif kind == "done":
@@ -938,10 +1002,15 @@ class StemFlowGUI:
                         state="normal",
                         text="重新启用 CUDA",
                     )
-                    self._append_log(str(payload))
+                    detail = str(payload)
+                    self._append_log(detail)
+                    advice = self._cuda_error_advice(detail)
+                    log_tail = self._cuda_log_tail()
                     messagebox.showerror(
                         "CUDA 安装失败",
-                        f"{payload}\n\nCPU 模式仍可正常使用，详细过程已写入日志。",
+                        f"{detail}\n\n{advice}\n\n"
+                        f"最近日志：\n{log_tail}\n\n"
+                        "CPU 模式仍可正常使用。界面可直接打开完整 CUDA 日志。",
                     )
         except queue.Empty:
             pass

@@ -1,0 +1,69 @@
+name: Build Windows CUDA repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Repair version
+        required: true
+        default: "1.4.1"
+  push:
+    tags:
+      - "repair-v*"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      APP_VERSION: ${{ inputs.version || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Build repair installer
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^repair-v', ''
+          .\scripts\windows\build-gui-repair.ps1 -Version $Version
+
+      - name: Verify repair package
+        shell: powershell
+        run: |
+          $Installer = Get-ChildItem `
+            .\dist\repair\StemFlow-Repair-*-x64.exe |
+            Select-Object -First 1
+          if (-not $Installer -or $Installer.Length -lt 100MB) {
+            throw "Repair installer is missing or unexpectedly small."
+          }
+          if ($Installer.Length -gt 1GB) {
+            throw "Repair installer unexpectedly contains the CUDA wheelhouse."
+          }
+          $Wheel = Get-ChildItem .\dist-repair\StemFlow -Recurse `
+            -Filter "torch-2.7.1+cu128-cp312-cp312-win_amd64.whl" |
+            Select-Object -First 1
+          $UpdatedGpuRuntime = Get-ChildItem .\dist-repair\StemFlow -Recurse `
+            -Filter "gpu_runtime.py" |
+            Where-Object { $_.FullName -like "*gpu-bootstrap*stemflow*app*" } |
+            Select-Object -First 1
+          if ($Wheel) {
+            throw "Repair installer must not duplicate the CUDA wheelhouse."
+          }
+          if (-not $UpdatedGpuRuntime) {
+            throw "Repair installer does not include updated CUDA runtime source."
+          }
+          Get-FileHash $Installer.FullName -Algorithm SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StemFlow-Windows-CUDA-Repair-${{ env.APP_VERSION }}
+          path: dist/repair/StemFlow-Repair-*-x64.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

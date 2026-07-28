@@ -8,8 +8,11 @@ import pytest
 
 from app.gpu_runtime import (
     OFFLINE_MANIFEST_NAME,
+    cuda_install_preflight,
+    minimum_driver_for,
     verify_offline_wheelhouse,
 )
+from app.hardware import NvidiaGpu
 
 
 def write_manifest(wheelhouse: Path, wheel: Path) -> None:
@@ -52,3 +55,48 @@ def test_verify_offline_wheelhouse_rejects_modified_wheel(
 
     with pytest.raises(RuntimeError, match="大小错误|校验失败"):
         verify_offline_wheelhouse(tmp_path)
+
+
+def test_blackwell_gpu_requires_cuda_128_driver() -> None:
+    gpu = NvidiaGpu("NVIDIA GeForce RTX 5060 Ti", "566.36", 8.0, 6.0)
+
+    assert minimum_driver_for(gpu) == (570, 65)
+
+
+def test_cuda_preflight_reports_outdated_driver(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    gpu = NvidiaGpu("NVIDIA GeForce RTX 5060 Ti", "566.36", 8.0, 6.0)
+    monkeypatch.setattr(
+        "app.gpu_runtime.detect_nvidia_gpu",
+        lambda: gpu,
+    )
+    monkeypatch.setattr(
+        "app.gpu_runtime.offline_wheelhouse",
+        lambda: tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="570.65"):
+        cuda_install_preflight()
+
+
+def test_cuda_preflight_reports_disk_and_driver(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    gpu = NvidiaGpu("NVIDIA GeForce RTX 5060 Ti", "576.88", 8.0, 6.0)
+    monkeypatch.setattr(
+        "app.gpu_runtime.detect_nvidia_gpu",
+        lambda: gpu,
+    )
+    monkeypatch.setattr(
+        "app.gpu_runtime.offline_wheelhouse",
+        lambda: tmp_path,
+    )
+    monkeypatch.setattr("app.gpu_runtime._disk_free_gb", lambda _path: 50.0)
+
+    result = cuda_install_preflight()
+
+    assert result["driver_version"] == "576.88"
+    assert result["free_disk_gb"] == 50.0

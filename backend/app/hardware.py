@@ -8,6 +8,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True, slots=True)
 class NvidiaGpu:
     name: str
+    driver_version: str
     total_memory_gb: float
     free_memory_gb: float
 
@@ -26,7 +27,7 @@ def detect_nvidia_gpu() -> NvidiaGpu | None:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=name,memory.total,memory.free",
+                "--query-gpu=name,driver_version,memory.total,memory.free",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -45,14 +46,15 @@ def detect_nvidia_gpu() -> NvidiaGpu | None:
         "",
     )
     parts = [part.strip() for part in first_line.split(",")]
-    if len(parts) < 3:
+    if len(parts) < 4:
         return None
     try:
         divisor = 1024.0
         return NvidiaGpu(
             name=parts[0],
-            total_memory_gb=float(parts[1]) / divisor,
-            free_memory_gb=float(parts[2]) / divisor,
+            driver_version=parts[1],
+            total_memory_gb=float(parts[2]) / divisor,
+            free_memory_gb=float(parts[3]) / divisor,
         )
     except ValueError:
         return None
@@ -71,7 +73,10 @@ def runtime_hardware() -> RuntimeHardware:
             name = torch.cuda.get_device_name(0)
             detail = f"CUDA 可用：{name}"
         elif gpu:
-            detail = f"检测到 {gpu.name}，CUDA 加速组件尚未启用"
+            detail = (
+                f"检测到 {gpu.name}（驱动 {gpu.driver_version}），"
+                "CUDA 加速组件尚未启用"
+            )
         else:
             detail = "未检测到可用的 NVIDIA CUDA 显卡"
         return RuntimeHardware(

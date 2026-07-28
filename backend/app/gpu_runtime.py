@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.hardware import NvidiaGpu, detect_nvidia_gpu
+
 
 CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 PYTHON_EMBED_URL = (
@@ -24,8 +26,11 @@ PYTHON_EMBED_SHA256 = (
 TORCH_VERSION = "2.7.1"
 TORCHVISION_VERSION = "0.22.1"
 TORCHAUDIO_VERSION = "2.7.1"
-GPU_RUNTIME_VERSION = "2"
+GPU_RUNTIME_VERSION = "3"
 OFFLINE_MANIFEST_NAME = "wheelhouse-manifest.json"
+MIN_CUDA12_WINDOWS_DRIVER = (528, 33)
+MIN_BLACKWELL_WINDOWS_DRIVER = (570, 65)
+MIN_INSTALL_FREE_GB = 12.0
 
 LogCallback = Callable[[str], None]
 
@@ -86,7 +91,65 @@ def offline_wheelhouse() -> Path | None:
     return None
 
 
-def verify_offline_wheelhouse(wheelhouse: Path) -> dict[str, Any]:
+def _version_tuple(value: str) -> tuple[int, int]:
+    parts = value.split(".")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return 0, 0
+
+
+def minimum_driver_for(gpu: NvidiaGpu) -> tuple[int, int]:
+    compact_name = gpu.name.upper().replace(" ", "")
+    if "RTX50" in compact_name:
+        return MIN_BLACKWELL_WINDOWS_DRIVER
+    return MIN_CUDA12_WINDOWS_DRIVER
+
+
+def _disk_free_gb(path: Path) -> float:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return shutil.disk_usage(candidate).free / (1024**3)
+
+
+def cuda_install_preflight() -> dict[str, Any]:
+    gpu = detect_nvidia_gpu()
+    if gpu is None:
+        raise RuntimeError(
+            "未检测到 NVIDIA 显卡或 nvidia-smi。请先安装 NVIDIA 官方驱动并重启。"
+        )
+    required_driver = minimum_driver_for(gpu)
+    if _version_tuple(gpu.driver_version) < required_driver:
+        required_text = ".".join(str(part) for part in required_driver)
+        raise RuntimeError(
+            f"{gpu.name} 当前驱动 {gpu.driver_version}，"
+            f"内置 CUDA 12.8 至少需要驱动 {required_text}。"
+            "请更新 NVIDIA 驱动并重启，不需要另装 CUDA Toolkit。"
+        )
+    wheelhouse = offline_wheelhouse()
+    if wheelhouse is None:
+        raise FileNotFoundError(
+            "安装包未包含 CUDA PyTorch 离线资源，请使用完整离线 GPU 套件。"
+        )
+    free_gb = _disk_free_gb(program_data_dir())
+    if free_gb < MIN_INSTALL_FREE_GB:
+        raise RuntimeError(
+            f"CUDA 运行环境所在磁盘仅剩 {free_gb:.1f} GB，"
+            f"至少需要 {MIN_INSTALL_FREE_GB:.0f} GB 空闲空间。"
+        )
+    return {
+        "gpu_name": gpu.name,
+        "driver_version": gpu.driver_version,
+        "free_disk_gb": free_gb,
+        "wheelhouse": str(wheelhouse),
+    }
+
+
+def verify_offline_wheelhouse(
+    wheelhouse: Path,
+    log: LogCallback | None = None,
+) -> dict[str, Any]:
     manifest_path = wheelhouse / OFFLINE_MANIFEST_NAME
     if not manifest_path.is_file():
         raise FileNotFoundError(f"CUDA 离线资源清单缺失：{manifest_path}")
@@ -97,7 +160,8 @@ def verify_offline_wheelhouse(wheelhouse: Path) -> dict[str, Any]:
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
         raise RuntimeError("CUDA 离线资源清单未包含 wheel 文件")
-    for entry in files:
+    total = len(files)
+    for index, entry in enumerate(files, start=1):
         if not isinstance(entry, dict):
             raise RuntimeError("CUDA 离线资源清单格式无效")
         name = str(entry.get("name", ""))
@@ -111,6 +175,8 @@ def verify_offline_wheelhouse(wheelhouse: Path) -> dict[str, Any]:
             or path.stat().st_size != expected_size
         ):
             raise RuntimeError(f"CUDA 离线资源缺失或大小错误：{name}")
+        if log and (expected_size >= 100 * 1024 * 1024 or index == total):
+            log(f"[1/4 校验资源] {index}/{total}：{name}")
         actual = _sha256_file(path)
         if actual != expected:
             raise RuntimeError(f"CUDA 离线资源校验失败：{name}")
@@ -166,6 +232,24 @@ def _enable_site_packages(python_dir: Path) -> None:
 
 def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
     """Install the bundled isolated CUDA runtime without network access."""
+    root = runtime_root()
+    python_dir = root / "python"
+    staging_dir = root / "python.installing"
+    backup_dir = root / "python.previous"
+    root.mkdir(parents=True, exist_ok=True)
+    if staging_dir.exists():
+        log("[恢复] 正在清理上一次未完成的 CUDA 临时目录…")
+        shutil.rmtree(staging_dir)
+    if python_dir.exists() and not marker_path().is_file():
+        log("[恢复] 正在清理上一次未完成的 CUDA 运行环境…")
+        shutil.rmtree(python_dir)
+
+    preflight = cuda_install_preflight()
+    log(
+        "[预检] "
+        f"{preflight['gpu_name']}，驱动 {preflight['driver_version']}，"
+        f"运行磁盘可用 {preflight['free_disk_gb']:.1f} GB。"
+    )
     assets = bundled_root() / "gpu-bootstrap"
     python_archive = assets / "python-3.12.10-embed-amd64.zip"
     get_pip = assets / "get-pip.py"
@@ -176,29 +260,23 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
     for required in (python_archive, get_pip, app_source, wheelhouse):
         if not required.exists():
             raise FileNotFoundError(f"安装资源缺失：{required}")
-    manifest = verify_offline_wheelhouse(wheelhouse)
+
+    manifest = verify_offline_wheelhouse(wheelhouse, log)
     log(
-        "CUDA PyTorch 离线资源校验通过："
+        "[1/4 校验资源] CUDA PyTorch 离线资源校验通过："
         f"{len(manifest['files'])} 个 wheel，安装过程无需联网。"
     )
     digest = _sha256_file(python_archive)
     if digest != PYTHON_EMBED_SHA256:
         raise RuntimeError(f"Python 安装资源校验失败：{digest}")
-    log(f"Python 安装资源 SHA256 校验通过：{digest}")
+    log(f"[1/4 校验资源] Python 安装资源 SHA256 校验通过：{digest}")
 
-    root = runtime_root()
-    python_dir = root / "python"
-    root.mkdir(parents=True, exist_ok=True)
-    marker_path().unlink(missing_ok=True)
-    if python_dir.exists():
-        shutil.rmtree(python_dir)
-    python_dir.mkdir(parents=True)
-
-    log("正在准备独立 NVIDIA CUDA 运行环境…")
+    log("[2/4 解压 Python] 正在准备独立 NVIDIA CUDA 运行环境…")
+    staging_dir.mkdir(parents=True)
     with zipfile.ZipFile(python_archive) as archive:
-        archive.extractall(python_dir)
-    _enable_site_packages(python_dir)
-    python = runtime_python()
+        archive.extractall(staging_dir)
+    _enable_site_packages(staging_dir)
+    python = staging_dir / "python.exe"
     if not python.is_file():
         raise RuntimeError("Python CUDA 运行环境安装后未找到 python.exe")
     offline_args = [
@@ -215,6 +293,7 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
         ],
         log,
     )
+    log("[3/4 安装组件] pip 已就绪，正在安装 CUDA PyTorch 和推理依赖…")
     _run_stream(
         [
             str(python),
@@ -234,24 +313,42 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
         log,
     )
 
-    site_packages = python_dir / "Lib" / "site-packages"
+    site_packages = staging_dir / "Lib" / "site-packages"
     target_app = site_packages / "app"
     if target_app.exists():
         shutil.rmtree(target_app)
     shutil.copytree(app_source, target_app)
 
+    log("[4/4 验证 GPU] 正在验证 PyTorch CUDA 与 ONNX Runtime GPU…")
     verification = (
-        "import json, torch; import onnxruntime as ort; "
-        "getattr(ort, 'preload_dlls', lambda: None)(); "
-        "providers=ort.get_available_providers(); "
-        "value={'cuda':torch.cuda.is_available(),"
-        "'device':torch.cuda.get_device_name(0) if torch.cuda.is_available() else '',"
-        "'providers':providers}; "
+        "import json, torch; "
+        "value={'torch':torch.__version__,'built_cuda':torch.version.cuda,"
+        "'cuda':torch.cuda.is_available(),"
+        "'device':torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}; "
         "print(json.dumps(value, ensure_ascii=False)); "
-        "raise SystemExit(0 if value['cuda'] and "
-        "'CUDAExecutionProvider' in providers else 3)"
+        "raise SystemExit(0 if value['cuda'] else 3)"
     )
     _run_stream([str(python), "-c", verification], log)
+    ort_verification = (
+        "import json; import onnxruntime as ort; "
+        "getattr(ort, 'preload_dlls', lambda: None)(); "
+        "providers=ort.get_available_providers(); "
+        "value={'onnxruntime':ort.__version__,'providers':providers}; "
+        "print(json.dumps(value, ensure_ascii=False)); "
+        "raise SystemExit(0 if 'CUDAExecutionProvider' in providers else 3)"
+    )
+    _run_stream([str(python), "-c", ort_verification], log)
+
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+    if python_dir.exists():
+        os.replace(python_dir, backup_dir)
+    try:
+        os.replace(staging_dir, python_dir)
+    except Exception:
+        if backup_dir.exists() and not python_dir.exists():
+            os.replace(backup_dir, python_dir)
+        raise
 
     marker = {
         "runtime_version": GPU_RUNTIME_VERSION,
@@ -269,6 +366,8 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
         encoding="utf-8",
     )
     os.replace(temporary, marker_path())
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
     log("NVIDIA CUDA 加速组件安装并验证成功。")
     return marker
 

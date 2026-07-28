@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Destination = ""
+    [string]$Destination = "",
+    [switch]$SkipCudaWheelhouse
 )
 
 Set-StrictMode -Version Latest
@@ -78,7 +79,10 @@ $RequiredTorchWheel = Get-ChildItem $WheelhouseDirectory `
     -Filter "torch-2.7.1+cu128-cp312-cp312-win_amd64.whl" `
     -ErrorAction SilentlyContinue |
     Select-Object -First 1
-if (-not $RequiredTorchWheel -or -not (Test-Path $WheelhouseManifest)) {
+if (
+    -not $SkipCudaWheelhouse -and
+    (-not $RequiredTorchWheel -or -not (Test-Path $WheelhouseManifest))
+) {
     Write-Host "Downloading complete offline CUDA PyTorch wheelhouse..." `
         -ForegroundColor Cyan
     Get-ChildItem $WheelhouseDirectory -File -ErrorAction SilentlyContinue |
@@ -130,12 +134,14 @@ if (-not $RequiredTorchWheel -or -not (Test-Path $WheelhouseManifest)) {
         Set-Content -Path $WheelhouseManifest -Encoding UTF8
 }
 
-$OfflineSize = (
-    Get-ChildItem $WheelhouseDirectory -Filter "*.whl" -File |
-        Measure-Object -Property Length -Sum
-).Sum
-if ($OfflineSize -lt 3GB) {
-    throw "Offline CUDA wheelhouse is unexpectedly small: $OfflineSize bytes"
+if (-not $SkipCudaWheelhouse) {
+    $OfflineSize = (
+        Get-ChildItem $WheelhouseDirectory -Filter "*.whl" -File |
+            Measure-Object -Property Length -Sum
+    ).Sum
+    if ($OfflineSize -lt 3GB) {
+        throw "Offline CUDA wheelhouse is unexpectedly small: $OfflineSize bytes"
+    }
 }
 
 $PythonArchive = Join-Path $GpuBootstrapDirectory "python-3.12.10-embed-amd64.zip"

@@ -84,3 +84,15 @@ def test_windowed_runtime_gets_standard_stream_sinks(monkeypatch) -> None:
     assert sys.stderr is not None
     sys.stdout.close()
     sys.stderr.close()
+
+
+def test_cuda_error_advice_is_actionable() -> None:
+    assert "更新 NVIDIA" in gui.StemFlowGUI._cuda_error_advice(
+        "driver version is too old"
+    )
+    assert "12 GB" in gui.StemFlowGUI._cuda_error_advice(
+        "磁盘空间不足"
+    )
+    assert "管理员" in gui.StemFlowGUI._cuda_error_advice(
+        "Access is denied"
+    )

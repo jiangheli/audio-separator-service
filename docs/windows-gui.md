@@ -88,6 +88,19 @@ CUDA 安装失败不会破坏 CPU 环境。GPU 任务使用独立 CUDA worker �
 模式能够真正让 CPU 和 GPU 同时处理不同视频。NVIDIA 驱动必须预先安装，且
 `nvidia-smi` 应能正常显示显卡。
 
+### CUDA 修复与诊断
+
+StemFlow 1.4.1 会在启用前检查 NVIDIA 驱动版本、离线资源和运行磁盘空间。
+RTX 50 系列使用内置 CUDA 12.8 运行环境时，驱动至少需要 570.65。这里只需要
+安装 NVIDIA 官方显卡驱动，不需要另外安装 CUDA Toolkit，也不要手工解压
+PyTorch wheel。
+
+安装过程会在界面和日志中显示“校验资源、解压 Python、安装组件、验证 GPU”
+四个阶段。如果已经安装过 StemFlow 1.4.0 完整离线套件，可以直接覆盖安装
+`StemFlow-Repair-1.4.1-x64.exe`。修复包复用原安装目录中的 CUDA wheelhouse，
+不需要重新下载约 4 GB 的完整套件。安装前请关闭 StemFlow，并保证系统盘至少
+有 12 GB 可用空间；修复后打开程序，点击“重新启用 CUDA”。
+
 ## 安装包包含
 
 - Python 3.12 运行时；
