@@ -74,6 +74,15 @@ def test_memory_estimate_and_worker_recommendation() -> None:
     assert gui.recommended_worker_count(64.0, 50.0, cpu_count=16) == 8
 
 
+def test_service_config_does_not_cap_requested_workers(tmp_path: Path) -> None:
+    settings = gui.default_settings()
+    settings["input_dir"] = str(tmp_path / "input")
+    settings["output_dir"] = str(tmp_path / "output")
+    settings["worker_count"] = 64
+
+    assert gui.service_config(settings).worker_count == 64
+
+
 def test_windowed_runtime_gets_standard_stream_sinks(monkeypatch) -> None:
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)

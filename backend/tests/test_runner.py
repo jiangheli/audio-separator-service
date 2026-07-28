@@ -4,6 +4,8 @@ import time
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from app.config import ServiceConfig
 from app.models import VideoProcessResult
 from app.report import ProcessingReport
@@ -243,3 +245,13 @@ def test_runner_routes_and_records_mixed_cpu_cuda_jobs(tmp_path: Path) -> None:
         for job in repository.list_jobs()
     }
     assert recorded_devices == {"cpu", "cuda"}
+
+
+def test_controller_allows_zero_per_device_and_has_no_default_cap() -> None:
+    controller = ConcurrencyController(1)
+
+    assert controller.set_allocation(cpu_workers=0, gpu_workers=20) == (0, 20)
+    assert controller.set_allocation(cpu_workers=30, gpu_workers=0) == (30, 0)
+
+    with pytest.raises(ValueError, match="at least one worker"):
+        controller.set_allocation(cpu_workers=0, gpu_workers=0)

@@ -39,7 +39,7 @@ from app.runner import ConcurrencyController
 APP_NAME = "StemFlow"
 TASK_NAME = "StemFlow-Video-BGM-Removal"
 DEFAULT_MODEL = "mdx"
-MAX_WORKERS = 8
+RECOMMENDATION_LIMIT = 8
 BASE_MEMORY_GB = 2.0
 MEMORY_PER_WORKER_GB = 3.0
 EXECUTION_MODES = {
@@ -109,10 +109,10 @@ def recommended_worker_count(
     processors = max(1, cpu_count or os.cpu_count() or 1)
     by_cpu = max(1, processors // 2)
     if total_memory_gb <= 0 or available_memory_gb <= 0:
-        return min(MAX_WORKERS, by_cpu, 2)
+        return min(RECOMMENDATION_LIMIT, by_cpu, 2)
     usable = min(available_memory_gb, max(0.0, total_memory_gb - BASE_MEMORY_GB))
     by_memory = max(1, int(max(0.0, usable - BASE_MEMORY_GB) / MEMORY_PER_WORKER_GB))
-    return max(1, min(MAX_WORKERS, by_cpu, by_memory))
+    return max(1, min(RECOMMENDATION_LIMIT, by_cpu, by_memory))
 
 
 def configure_cpu_budget(worker_count: int) -> int:
@@ -450,8 +450,8 @@ class StemFlowGUI:
         self.cpu_worker_picker = ttk.Combobox(
             worker_frame,
             textvariable=self.cpu_worker_count,
-            values=tuple(str(value) for value in range(1, MAX_WORKERS + 1)),
-            state="readonly",
+            values=tuple(str(value) for value in range(17)),
+            state="normal",
             width=5,
         )
         self.cpu_worker_picker.pack(side="left", padx=(5, 14))
@@ -459,12 +459,14 @@ class StemFlowGUI:
             "<<ComboboxSelected>>",
             self._apply_live_concurrency,
         )
+        self.cpu_worker_picker.bind("<Return>", self._apply_live_concurrency)
+        self.cpu_worker_picker.bind("<FocusOut>", self._apply_live_concurrency)
         ttk.Label(worker_frame, text="GPU").pack(side="left")
         self.gpu_worker_picker = ttk.Combobox(
             worker_frame,
             textvariable=self.gpu_worker_count,
-            values=tuple(str(value) for value in range(1, MAX_WORKERS + 1)),
-            state="readonly",
+            values=tuple(str(value) for value in range(17)),
+            state="normal",
             width=5,
         )
         self.gpu_worker_picker.pack(side="left", padx=(5, 14))
@@ -472,6 +474,8 @@ class StemFlowGUI:
             "<<ComboboxSelected>>",
             self._apply_live_concurrency,
         )
+        self.gpu_worker_picker.bind("<Return>", self._apply_live_concurrency)
+        self.gpu_worker_picker.bind("<FocusOut>", self._apply_live_concurrency)
         ttk.Button(
             worker_frame,
             text="使用建议值",
@@ -598,10 +602,8 @@ class StemFlowGUI:
     def _use_recommended_workers(self) -> None:
         mode = self._selected_mode()
         if mode == "hybrid":
-            gpu = min(self.recommended_gpu_workers, MAX_WORKERS - 1)
-            cpu = min(self.recommended_workers, MAX_WORKERS - gpu)
-            self.cpu_worker_count.set(str(max(1, cpu)))
-            self.gpu_worker_count.set(str(max(1, gpu)))
+            self.cpu_worker_count.set(str(self.recommended_workers))
+            self.gpu_worker_count.set(str(self.recommended_gpu_workers))
         elif mode == "cuda":
             self.gpu_worker_count.set(str(self.recommended_gpu_workers))
         else:
@@ -613,19 +615,24 @@ class StemFlowGUI:
 
     def _selected_allocation(self) -> tuple[int, int]:
         mode = self._selected_mode()
-        cpu = int(self.cpu_worker_count.get() or "1") if mode != "cuda" else 0
-        gpu = int(self.gpu_worker_count.get() or "1") if mode != "cpu" else 0
-        if cpu + gpu > MAX_WORKERS:
-            raise ValueError(f"CPU 与 GPU 总并发不能超过 {MAX_WORKERS}")
+        try:
+            cpu = int(self.cpu_worker_count.get().strip()) if mode != "cuda" else 0
+            gpu = int(self.gpu_worker_count.get().strip()) if mode != "cpu" else 0
+        except ValueError as error:
+            raise ValueError("CPU 和 GPU 并发必须填写整数") from error
+        if cpu < 0 or gpu < 0:
+            raise ValueError("CPU 和 GPU 并发不能为负数")
+        if cpu + gpu < 1:
+            raise ValueError("CPU 和 GPU 可以单独设为 0，但不能同时为 0")
         return cpu, gpu
 
     def _update_mode_controls(self) -> None:
         mode = self._selected_mode()
         self.cpu_worker_picker.configure(
-            state="readonly" if mode != "cuda" else "disabled"
+            state="normal" if mode != "cuda" else "disabled"
         )
         self.gpu_worker_picker.configure(
-            state="readonly" if mode != "cpu" else "disabled"
+            state="normal" if mode != "cpu" else "disabled"
         )
 
     def _apply_live_concurrency(self, _event: object | None = None) -> None:
@@ -920,7 +927,7 @@ class StemFlowGUI:
             return
 
         self.stop_requested.clear()
-        self.concurrency = ConcurrencyController(1, maximum=MAX_WORKERS)
+        self.concurrency = ConcurrencyController(1)
         self.concurrency.set_allocation(
             cpu_workers=cpu_workers,
             gpu_workers=gpu_workers,
@@ -1149,7 +1156,7 @@ def run_scheduled() -> int:
             if mode != "cpu"
             else 0
         )
-        controller = ConcurrencyController(1, maximum=MAX_WORKERS)
+        controller = ConcurrencyController(1)
         controller.set_allocation(
             cpu_workers=cpu_workers,
             gpu_workers=gpu_workers,

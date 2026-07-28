@@ -23,8 +23,13 @@ from app.services.video_pipeline import VideoBgmRemovalPipeline
 class ConcurrencyController:
     """Thread-safe CPU/GPU worker allocation that can change during a batch."""
 
-    def __init__(self, initial: int, *, maximum: int = 8) -> None:
-        if maximum < 1:
+    def __init__(
+        self,
+        initial: int,
+        *,
+        maximum: int | None = None,
+    ) -> None:
+        if maximum is not None and maximum < 1:
             raise ValueError("maximum must be at least 1")
         self.maximum = maximum
         self._cpu_workers = 1
@@ -53,7 +58,12 @@ class ConcurrencyController:
         cpu = int(cpu_workers)
         gpu = int(gpu_workers)
         total = cpu + gpu
-        if cpu < 0 or gpu < 0 or total < 1 or total > self.maximum:
+        if cpu < 0 or gpu < 0 or total < 1:
+            raise ValueError(
+                "CPU and GPU concurrency must be non-negative, "
+                "with at least one worker in total"
+            )
+        if self.maximum is not None and total > self.maximum:
             raise ValueError(
                 f"combined concurrency must be between 1 and {self.maximum}"
             )
@@ -201,8 +211,9 @@ class BatchRunner:
         outcomes: list[str] = []
         next_job = 0
         active: dict[Future[str], str] = {}
+        executor_capacity = controller.maximum or max(1, len(jobs))
         with ThreadPoolExecutor(
-            max_workers=controller.maximum,
+            max_workers=executor_capacity,
             thread_name_prefix="stemflow-worker",
         ) as executor:
             while next_job < len(jobs) or active:

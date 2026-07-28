@@ -6,7 +6,7 @@ on:
       version:
         description: Repair version
         required: true
-        default: "1.4.1"
+        default: "1.4.2"
   push:
     tags:
       - "repair-v*"
