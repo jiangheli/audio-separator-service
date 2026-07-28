@@ -10,6 +10,7 @@ from app.gpu_runtime import (
     OFFLINE_MANIFEST_NAME,
     cuda_install_preflight,
     minimum_driver_for,
+    sync_runtime_app,
     verify_offline_wheelhouse,
 )
 from app.hardware import NvidiaGpu
@@ -100,3 +101,24 @@ def test_cuda_preflight_reports_disk_and_driver(
 
     assert result["driver_version"] == "576.88"
     assert result["free_disk_gb"] == 50.0
+
+
+def test_sync_runtime_app_updates_code_without_reinstalling_gpu(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    source = bundle / "gpu-bootstrap" / "stemflow" / "app"
+    source.mkdir(parents=True)
+    (source / "gpu_worker.py").write_text("new-code", encoding="utf-8")
+    runtime = tmp_path / "runtime"
+    target = runtime / "python" / "Lib" / "site-packages" / "app"
+    target.mkdir(parents=True)
+    (target / "gpu_worker.py").write_text("old-code", encoding="utf-8")
+    monkeypatch.setattr("app.gpu_runtime.runtime_ready", lambda: True)
+    monkeypatch.setattr("app.gpu_runtime.bundled_root", lambda: bundle)
+    monkeypatch.setattr("app.gpu_runtime.runtime_root", lambda: runtime)
+
+    assert sync_runtime_app() is True
+    assert (target / "gpu_worker.py").read_text(encoding="utf-8") == "new-code"
+    assert (runtime / "app-version.txt").is_file()

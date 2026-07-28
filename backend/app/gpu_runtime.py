@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app import __version__
 from app.hardware import NvidiaGpu, detect_nvidia_gpu
 
 
@@ -80,6 +81,48 @@ def runtime_ready() -> bool:
         value = json.loads(marker.read_text(encoding="utf-8"))
         return value.get("runtime_version") == GPU_RUNTIME_VERSION
     except (json.JSONDecodeError, OSError):
+        return False
+
+
+def sync_runtime_app() -> bool:
+    """Refresh GPU worker application code without reinstalling CUDA packages."""
+    if not runtime_ready():
+        return False
+    source = bundled_root() / "gpu-bootstrap" / "stemflow" / "app"
+    target = runtime_root() / "python" / "Lib" / "site-packages" / "app"
+    version_file = runtime_root() / "app-version.txt"
+    try:
+        installed_version = (
+            version_file.read_text(encoding="utf-8").strip()
+            if version_file.is_file()
+            else ""
+        )
+        if installed_version == __version__:
+            return True
+        if not source.is_dir():
+            return False
+        staging = target.with_name("app.updating")
+        backup = target.with_name("app.previous")
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup.exists():
+            shutil.rmtree(backup)
+        shutil.copytree(source, staging)
+        if target.exists():
+            os.replace(target, backup)
+        try:
+            os.replace(staging, target)
+        except Exception:
+            if backup.exists() and not target.exists():
+                os.replace(backup, target)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+        temporary = version_file.with_suffix(".tmp")
+        temporary.write_text(__version__, encoding="utf-8")
+        os.replace(temporary, version_file)
+        return True
+    except OSError:
         return False
 
 
@@ -366,6 +409,10 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
         encoding="utf-8",
     )
     os.replace(temporary, marker_path())
+    (runtime_root() / "app-version.txt").write_text(
+        __version__,
+        encoding="utf-8",
+    )
     if backup_dir.exists():
         shutil.rmtree(backup_dir)
     log("NVIDIA CUDA 加速组件安装并验证成功。")
@@ -374,6 +421,8 @@ def install_cuda_runtime(log: LogCallback) -> dict[str, Any]:
 
 def cuda_runtime_available() -> bool:
     if not runtime_ready():
+        return False
+    if not sync_runtime_app():
         return False
     verification = (
         "import torch; import onnxruntime as ort; "

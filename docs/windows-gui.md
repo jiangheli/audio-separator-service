@@ -120,6 +120,24 @@ PyTorch wheel。
 2 GiB，完整离线套件由一个 `StemFlow-Setup-*-x64.exe` 和若干同名 `.bin` 分卷
 组成。必须把 EXE 和全部 BIN 文件放在同一文件夹，再双击 EXE 安装。
 
+## 软件内更新
+
+StemFlow 启动后会在后台检查 GitHub 最新正式 Release，也可以点击窗口右上角的
+“检查更新”。发现新版本后只下载：
+
+```text
+StemFlow-Update-<版本>-x64.exe
+StemFlow-Update-<版本>-x64.exe.sha256
+```
+
+程序先验证 SHA-256，再启动更新安装程序。更新软件本体不会重新下载 3.3 GB 的
+CUDA wheelhouse，也不会删除或重装 `%ProgramData%\StemFlow\gpu-runtime`。
+GPU worker 的少量应用代码会自动同步到已有运行环境，但 PyTorch、TorchAudio、
+TorchVision 和 ONNX Runtime GPU 继续复用原来的安装。
+
+只有未来 Release 明确声明升级 CUDA/PyTorch 运行时版本时，才需要单独升级 GPU
+组件。普通功能修复、界面更新和处理逻辑更新都使用轻量更新包。
+
 ## 定时任务
 
 勾选“每天自动运行”，填写 `HH:MM`，再点击“保存定时”。Windows Server
@@ -159,15 +177,18 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.4.0"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.5.0"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.4.0-x64.exe
-dist\installer\StemFlow-Setup-1.4.0-x64-1.bin
-dist\installer\StemFlow-Setup-1.4.0-x64-2.bin
+dist\installer\StemFlow-Setup-1.5.0-x64.exe
+dist\installer\StemFlow-Setup-1.5.0-x64-1.bin
+dist\installer\StemFlow-Setup-1.5.0-x64-2.bin
+dist\update\StemFlow-Update-1.5.0-x64.exe
+dist\update\StemFlow-Update-1.5.0-x64.exe.sha256
 ```
 
-也可以手动触发 GitHub Actions 的 `Build Windows GUI installer` 工作流。
+也可以推送 `gui-v<版本>` 标签触发 GitHub Actions。标签构建成功后会自动创建
+GitHub Release，同时上传完整 GPU 安装分卷、轻量更新包和 SHA-256 校验文件。

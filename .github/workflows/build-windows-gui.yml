@@ -1,12 +1,15 @@
 name: Build Windows GUI installer
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
       version:
         description: Installer version
         required: true
-        default: "1.4.0"
+        default: "1.5.0"
   push:
     tags:
       - "gui-v*"
@@ -127,6 +130,7 @@ jobs:
       - name: Verify installer
         shell: powershell
         run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
           $Installer = Get-ChildItem .\dist\installer\StemFlow-Setup-*-x64.exe |
             Select-Object -First 1
           $InstallerParts = @(Get-ChildItem `
@@ -138,17 +142,101 @@ jobs:
           if ($TotalBytes -lt 3GB) {
             throw "Offline GPU installer is unexpectedly small."
           }
-          foreach ($Part in $InstallerParts) {
+          $Checksums = foreach ($Part in $InstallerParts) {
             if ($Part.Length -gt 2GB) {
               throw "Installer part exceeds GitHub Release limit: $($Part.Name)"
             }
-            Get-FileHash $Part.FullName -Algorithm SHA256
+            $Hash = (Get-FileHash $Part.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$Hash  $($Part.Name)"
+          }
+          $Checksums | Set-Content `
+            ".\dist\installer\StemFlow-$Version-SHA256SUMS.txt" `
+            -Encoding ascii
+
+      - name: Build lightweight updater
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          .\scripts\windows\build-gui-update.ps1 `
+            -Version $Version `
+            -SkipDependencyInstall `
+            -SkipAssetDownload
+
+      - name: Verify lightweight updater
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          $Installer = Get-Item `
+            ".\dist\update\StemFlow-Update-$Version-x64.exe"
+          $Checksum = Get-Item "$($Installer.FullName).sha256"
+          if ($Installer.Length -lt 100MB -or $Installer.Length -gt 1GB) {
+            throw "Lightweight updater size is invalid: $($Installer.Length)"
+          }
+          $Wheel = Get-ChildItem .\dist-update\StemFlow -Recurse `
+            -Filter "torch-2.7.1+cu128-cp312-cp312-win_amd64.whl" |
+            Select-Object -First 1
+          if ($Wheel) {
+            throw "Lightweight updater must not contain the CUDA wheelhouse."
+          }
+          $Expected = (Get-Content $Checksum.FullName).Split()[0]
+          $Actual = (Get-FileHash $Installer.FullName -Algorithm SHA256).Hash
+          if ($Expected -ne $Actual) {
+            throw "Lightweight updater SHA256 mismatch."
           }
 
       - uses: actions/upload-artifact@v4
         with:
           name: StemFlow-Windows-GUI-${{ env.APP_VERSION }}
-          path: dist/installer/StemFlow-Setup-*-x64*
+          path: |
+            dist/installer/StemFlow-Setup-*-x64*
+            dist/installer/StemFlow-*-SHA256SUMS.txt
+            dist/update/StemFlow-Update-*-x64.exe
+            dist/update/StemFlow-Update-*-x64.exe.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/gui-v')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          $NotesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          @"
+          ## StemFlow $Version
+
+          ### 新用户：完整内置 GPU 版
+
+          下载 `StemFlow-Setup-$Version-x64.exe` 和全部同名 `.bin` 分卷，
+          放在同一文件夹后运行 EXE。安装包已经包含 CUDA 12.8 版
+          PyTorch、TorchAudio、TorchVision 和 ONNX Runtime GPU 离线资源。
+
+          ### 已安装用户：软件内更新
+
+          在 StemFlow 中点击“检查更新”。程序只下载
+          `StemFlow-Update-$Version-x64.exe`，不会重新下载、删除或安装
+          已有的 CUDA/PyTorch GPU 环境。
+
+          ### 完整性校验
+
+          Release 同时提供完整安装包校验清单，以及自动更新 EXE 的独立
+          SHA-256 文件。
+          "@ | Set-Content $NotesPath -Encoding UTF8
+
+          $Assets = @(
+            Get-ChildItem .\dist\installer\StemFlow-Setup-*-x64* -File
+            Get-ChildItem .\dist\installer\StemFlow-*-SHA256SUMS.txt -File
+            Get-ChildItem .\dist\update\StemFlow-Update-*-x64.exe -File
+            Get-ChildItem .\dist\update\StemFlow-Update-*-x64.exe.sha256 -File
+          ) | ForEach-Object { $_.FullName }
+
+          if (gh release view $env:GITHUB_REF_NAME 2>$null) {
+            gh release upload $env:GITHUB_REF_NAME $Assets --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME $Assets `
+              --title "StemFlow Windows GUI $Version" `
+              --notes-file $NotesPath
+          }
+          gh release edit $env:GITHUB_REF_NAME --latest

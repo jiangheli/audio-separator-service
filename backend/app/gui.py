@@ -16,6 +16,7 @@ from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
 
+from app import __version__
 from app.cli.main import make_runner
 from app.config import ServiceConfig
 from app.gpu_runtime import (
@@ -34,6 +35,7 @@ from app.hardware import (
 )
 from app.repository import ProcessingRepository
 from app.runner import ConcurrencyController
+from app.updater import AvailableUpdate, check_for_update, download_update
 
 
 APP_NAME = "StemFlow"
@@ -309,6 +311,8 @@ class StemFlowGUI:
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.runtime_installer: threading.Thread | None = None
+        self.update_worker: threading.Thread | None = None
+        self.pending_update_installer: Path | None = None
         self.concurrency: ConcurrencyController | None = None
         self.stop_requested = threading.Event()
         self.settings = load_settings()
@@ -357,6 +361,7 @@ class StemFlowGUI:
         self._refresh_jobs()
         self.root.after(200, self._drain_events)
         self.root.after(750, self._poll_jobs)
+        self.root.after(2000, lambda: self._check_for_updates(manual=False))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_window(self) -> None:
@@ -381,12 +386,24 @@ class StemFlowGUI:
 
         heading = ttk.Frame(outer)
         heading.pack(fill="x", pady=(0, 18))
-        ttk.Label(heading, text="StemFlow", style="Title.TLabel").pack(anchor="w")
+        heading_left = ttk.Frame(heading)
+        heading_left.pack(side="left", fill="x", expand=True)
         ttk.Label(
-            heading,
+            heading_left,
+            text=f"StemFlow  {__version__}",
+            style="Title.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            heading_left,
             text="选择文件夹，自动去除视频 BGM，并把人声重新合成回原画面。",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(4, 0))
+        self.update_button = ttk.Button(
+            heading,
+            text="检查更新",
+            command=lambda: self._check_for_updates(manual=True),
+        )
+        self.update_button.pack(side="right", anchor="n")
 
         settings = ttk.LabelFrame(outer, text="处理设置", padding=14)
         settings.pack(fill="x")
@@ -719,6 +736,126 @@ class StemFlowGUI:
         self.root.clipboard_append(self.cuda_url_var.get())
         self.status_var.set("CUDA 下载地址已复制")
 
+    def _check_for_updates(self, *, manual: bool) -> None:
+        if self.pending_update_installer is not None:
+            self._launch_update_installer(self.pending_update_installer)
+            return
+        if self.update_worker and self.update_worker.is_alive():
+            return
+        if (
+            (self.worker and self.worker.is_alive())
+            or (self.runtime_installer and self.runtime_installer.is_alive())
+        ):
+            if manual:
+                messagebox.showwarning(
+                    "暂时不能更新",
+                    "请等待当前视频任务或 CUDA 安装完成后再检查更新。",
+                )
+            return
+        self.update_button.configure(state="disabled", text="正在检查…")
+        if manual:
+            self.status_var.set("正在检查 GitHub Release 更新…")
+
+        def check() -> None:
+            try:
+                update = check_for_update(__version__)
+                self.events.put(("update-checked", (manual, update)))
+            except Exception as error:
+                self.events.put(
+                    (
+                        "update-check-error",
+                        (manual, f"{type(error).__name__}: {error}"),
+                    )
+                )
+
+        self.update_worker = threading.Thread(
+            target=check,
+            daemon=True,
+            name="stemflow-update-check",
+        )
+        self.update_worker.start()
+
+    def _confirm_update(self, update: AvailableUpdate) -> None:
+        size_mb = update.size_bytes / (1024**2) if update.size_bytes else 0
+        notes = update.notes.strip()
+        if len(notes) > 700:
+            notes = notes[:700].rstrip() + "…"
+        detail = (
+            f"发现 StemFlow {update.version}\n"
+            f"核心更新包约 {size_mb:.0f} MB。\n\n"
+            "本次只更新软件本体，不会下载、删除或重装已经启用的 "
+            "CUDA/PyTorch GPU 环境。"
+        )
+        if notes:
+            detail += f"\n\n更新说明：\n{notes}"
+        detail += "\n\n是否下载并安装？"
+        if not messagebox.askyesno("发现新版本", detail):
+            self.status_var.set(f"已取消更新到 {update.version}")
+            return
+        self._download_available_update(update)
+
+    def _download_available_update(self, update: AvailableUpdate) -> None:
+        self.update_button.configure(state="disabled", text="正在下载…")
+        self.status_var.set(f"正在下载 StemFlow {update.version}…")
+
+        def progress(current: int, total: int) -> None:
+            percent = int(current * 100 / total) if total > 0 else 0
+            self.events.put(("update-progress", (update.version, percent)))
+
+        def download() -> None:
+            try:
+                target = download_update(
+                    update,
+                    program_data_dir() / "updates",
+                    progress,
+                )
+                self.events.put(("update-ready", target))
+            except Exception as error:
+                self.events.put(
+                    (
+                        "update-download-error",
+                        f"{type(error).__name__}: {error}",
+                    )
+                )
+
+        self.update_worker = threading.Thread(
+            target=download,
+            daemon=True,
+            name="stemflow-update-download",
+        )
+        self.update_worker.start()
+
+    def _launch_update_installer(self, installer: Path) -> None:
+        if self.worker and self.worker.is_alive():
+            self.pending_update_installer = installer
+            self.update_button.configure(
+                state="normal",
+                text="安装已下载更新",
+            )
+            messagebox.showinfo(
+                "更新已经下载",
+                "请等待当前视频处理完成，再点击“安装已下载更新”。",
+            )
+            return
+        try:
+            subprocess.Popen(
+                [
+                    str(installer),
+                    "/SILENT",
+                    "/SUPPRESSMSGBOXES",
+                    "/NORESTART",
+                    "/CLOSEAPPLICATIONS",
+                ],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as error:
+            messagebox.showerror("无法启动更新", f"{installer}\n\n{error}")
+            self.update_button.configure(state="normal", text="安装已下载更新")
+            return
+        self.pending_update_installer = None
+        self.status_var.set("更新安装程序已启动，StemFlow 即将关闭")
+        self.root.after(800, self.root.destroy)
+
     @staticmethod
     def _cuda_log_path() -> Path:
         return program_data_dir() / "logs" / "cuda-install.log"
@@ -1018,6 +1155,58 @@ class StemFlowGUI:
                         f"{detail}\n\n{advice}\n\n"
                         f"最近日志：\n{log_tail}\n\n"
                         "CPU 模式仍可正常使用。界面可直接打开完整 CUDA 日志。",
+                    )
+                elif kind == "update-checked":
+                    manual, update = payload
+                    self.update_button.configure(
+                        state="normal",
+                        text="检查更新",
+                    )
+                    if update is None:
+                        self.status_var.set(f"当前已是最新版本 {__version__}")
+                        if manual:
+                            messagebox.showinfo(
+                                "没有新版本",
+                                f"当前 StemFlow {__version__} 已是最新版本。",
+                            )
+                    else:
+                        self._confirm_update(update)
+                elif kind == "update-check-error":
+                    manual, detail = payload
+                    self.update_button.configure(
+                        state="normal",
+                        text="检查更新",
+                    )
+                    self._append_log(f"更新检查失败：{detail}")
+                    if manual:
+                        self.status_var.set("更新检查失败")
+                        messagebox.showerror(
+                            "更新检查失败",
+                            f"{detail}\n\n请检查网络能否访问 GitHub。",
+                        )
+                elif kind == "update-progress":
+                    version, percent = payload
+                    self.status_var.set(
+                        f"正在下载 StemFlow {version}：{percent}%"
+                    )
+                elif kind == "update-ready":
+                    installer = Path(str(payload))
+                    self.pending_update_installer = installer
+                    self.update_button.configure(
+                        state="normal",
+                        text="安装已下载更新",
+                    )
+                    self._launch_update_installer(installer)
+                elif kind == "update-download-error":
+                    self.update_button.configure(
+                        state="normal",
+                        text="检查更新",
+                    )
+                    self.status_var.set("更新下载失败")
+                    self._append_log(f"更新下载失败：{payload}")
+                    messagebox.showerror(
+                        "更新下载失败",
+                        f"{payload}\n\n现有版本和 GPU 环境未受影响。",
                     )
         except queue.Empty:
             pass
