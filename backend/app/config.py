@@ -1,66 +1,158 @@
-from functools import lru_cache
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import asdict, dataclass
 from pathlib import Path
-
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Any
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="AUDIO_SERVICE_", env_file=".env", extra="ignore")
+DEFAULT_MODEL = "UVR-MDX-NET-Inst_HQ_3.onnx"
+TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
-    data_dir: Path = Path("./data")
-    database_path: Path | None = None
-    model_dir: Path | None = None
-    task_mode: str = "local"
-    redis_url: str = "redis://redis:6379/0"
-    queue_name: str = "audio-separator:tasks"
-    worker_concurrency: int = Field(default=2, ge=1, le=16)
-    default_model: str = "UVR-MDX-NET-Inst_HQ_3.onnx"
-    output_format: str = "WAV"
-    chunk_duration: float | None = None
-    mdx_segment_size: int = 32
-    mdxc_segment_size: int = 256
-    mdxc_override_model_segment_size: bool = True
-    cors_origins: str = "http://localhost:3000,http://localhost:5173"
-    automation_enabled: bool = False
-    automation_input_dir: Path = Path("/input")
-    automation_output_dir: Path = Path("/output")
-    automation_schedule_mode: str = "daily"
-    automation_daily_time: str = "00:00"
-    automation_timezone: str = "Asia/Shanghai"
-    automation_interval_minutes: int = Field(default=5, ge=1, le=1440)
-    automation_stable_seconds: int = Field(default=60, ge=0, le=86400)
-    automation_max_retries: int = Field(default=3, ge=0, le=20)
-    automation_model: str = "default"
-    automation_poll_seconds: int = Field(default=2, ge=1, le=60)
 
-    def prepare(self) -> "Settings":
-        self.data_dir = self.data_dir.expanduser().resolve()
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "uploads").mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "output").mkdir(parents=True, exist_ok=True)
-        if self.database_path is None:
-            self.database_path = self.data_dir / "tasks.db"
-        else:
-            self.database_path = self.database_path.expanduser().resolve()
-        if self.model_dir is None:
-            self.model_dir = self.data_dir / "models"
-        else:
-            self.model_dir = self.model_dir.expanduser().resolve()
+def _expand_path(value: str | Path, *, base: Path) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(str(value)))
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = base / path
+    return path.resolve()
+
+
+@dataclass(slots=True)
+class ServiceConfig:
+    input_dir: Path
+    output_dir: Path
+    data_dir: Path
+    model_dir: Path
+    work_dir: Path
+    log_dir: Path
+    database_path: Path
+    report_path: Path
+    schedule_time: str = "00:00"
+    model: str = DEFAULT_MODEL
+    stable_seconds: int = 120
+    max_retries: int = 3
+    output_suffix: str = "_vocals_only"
+    audio_bitrate: str = "192k"
+    recursive: bool = True
+    keep_failed_work: bool = False
+    video_copy: bool = True
+    worker_count: int = 1
+    gpu_worker_count: int = 1
+    gpu_prepare_threads: int = 2
+    gpu_compose_threads: int = 2
+    gpu_prefetch: int = 2
+    gpu_cpu_threads: int = 4
+    gpu_batch_size: int = 2
+    gpu_segment_size: int = 256
+    concatenate_by_folder: bool = False
+
+    @classmethod
+    def load(cls, config_path: str | Path) -> "ServiceConfig":
+        path = Path(config_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Configuration file does not exist: {path}")
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(raw, dict):
+            raise ValueError("Configuration root must be a JSON object")
+        return cls.from_mapping(raw, base=path.parent)
+
+    @classmethod
+    def from_mapping(cls, raw: dict[str, Any], *, base: Path) -> "ServiceConfig":
+        missing = [
+            name
+            for name in ("input_dir", "output_dir")
+            if not str(raw.get(name, "")).strip()
+        ]
+        if missing:
+            raise ValueError(f"Missing required configuration values: {', '.join(missing)}")
+
+        data_dir = _expand_path(raw.get("data_dir", "./data"), base=base)
+        config = cls(
+            input_dir=_expand_path(raw["input_dir"], base=base),
+            output_dir=_expand_path(raw["output_dir"], base=base),
+            data_dir=data_dir,
+            model_dir=_expand_path(raw.get("model_dir", data_dir / "models"), base=base),
+            work_dir=_expand_path(raw.get("work_dir", data_dir / "work"), base=base),
+            log_dir=_expand_path(raw.get("log_dir", data_dir / "logs"), base=base),
+            database_path=_expand_path(
+                raw.get("database_path", data_dir / "processing.db"),
+                base=base,
+            ),
+            report_path=_expand_path(
+                raw.get("report_path", data_dir / "processing_status.xlsx"),
+                base=base,
+            ),
+            schedule_time=str(raw.get("schedule_time", "00:00")),
+            model=str(raw.get("model", DEFAULT_MODEL)).strip() or DEFAULT_MODEL,
+            stable_seconds=int(raw.get("stable_seconds", 120)),
+            max_retries=int(raw.get("max_retries", 3)),
+            output_suffix=str(raw.get("output_suffix", "_vocals_only")),
+            audio_bitrate=str(raw.get("audio_bitrate", "192k")),
+            recursive=bool(raw.get("recursive", True)),
+            keep_failed_work=bool(raw.get("keep_failed_work", False)),
+            video_copy=bool(raw.get("video_copy", True)),
+            worker_count=int(raw.get("worker_count", 1)),
+            gpu_worker_count=int(raw.get("gpu_worker_count", 1)),
+            gpu_prepare_threads=int(raw.get("gpu_prepare_threads", 2)),
+            gpu_compose_threads=int(raw.get("gpu_compose_threads", 2)),
+            gpu_prefetch=int(raw.get("gpu_prefetch", 2)),
+            gpu_cpu_threads=int(raw.get("gpu_cpu_threads", 4)),
+            gpu_batch_size=int(raw.get("gpu_batch_size", 2)),
+            gpu_segment_size=int(raw.get("gpu_segment_size", 256)),
+            concatenate_by_folder=bool(raw.get("concatenate_by_folder", False)),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if not TIME_PATTERN.fullmatch(self.schedule_time):
+            raise ValueError("schedule_time must use HH:MM in 24-hour format")
+        if self.stable_seconds < 0 or self.stable_seconds > 86400:
+            raise ValueError("stable_seconds must be between 0 and 86400")
+        if self.max_retries < 0 or self.max_retries > 20:
+            raise ValueError("max_retries must be between 0 and 20")
+        if self.worker_count < 1:
+            raise ValueError("worker_count must be at least 1")
+        if self.gpu_worker_count < 0:
+            raise ValueError("gpu_worker_count cannot be negative")
+        if self.gpu_prepare_threads < 1 or self.gpu_compose_threads < 1:
+            raise ValueError("GPU prepare and compose threads must be at least 1")
+        if self.gpu_prefetch < 0:
+            raise ValueError("gpu_prefetch cannot be negative")
+        if self.gpu_cpu_threads < 1:
+            raise ValueError("gpu_cpu_threads must be at least 1")
+        if self.gpu_batch_size < 1 or self.gpu_batch_size > 32:
+            raise ValueError("gpu_batch_size must be between 1 and 32")
+        if (
+            self.gpu_segment_size < 32
+            or self.gpu_segment_size > 1024
+            or self.gpu_segment_size % 32
+        ):
+            raise ValueError(
+                "gpu_segment_size must be a multiple of 32 between 32 and 1024"
+            )
+        if not self.output_suffix or any(char in self.output_suffix for char in '<>:"/\\|?*'):
+            raise ValueError("output_suffix contains invalid filename characters")
+        if not re.fullmatch(r"\d{2,4}k", self.audio_bitrate):
+            raise ValueError("audio_bitrate must look like 128k or 192k")
+        if self.input_dir == self.output_dir:
+            raise ValueError("input_dir and output_dir must be different")
+
+    def prepare_directories(self) -> None:
+        self.input_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        self.automation_input_dir = self.automation_input_dir.expanduser().resolve()
-        self.automation_output_dir = self.automation_output_dir.expanduser().resolve()
-        return self
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    @property
-    def automation_report_path(self) -> Path:
-        return self.data_dir / "processing_status.xlsx"
-
-    @property
-    def origins(self) -> list[str]:
-        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
-
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings().prepare()
+    def public_dict(self) -> dict[str, Any]:
+        values = asdict(self)
+        return {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in values.items()
+        }

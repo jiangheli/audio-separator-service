@@ -1,0 +1,263 @@
+name: Build Windows GUI installer
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Installer version
+        required: true
+        default: "1.8.0"
+  push:
+    tags:
+      - "gui-v*"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      APP_VERSION: ${{ inputs.version || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Build installer
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          .\scripts\windows\build-gui-installer.ps1 -Version $Version
+
+      - name: Smoke test packaged inference
+        shell: powershell
+        run: |
+          $SmokeRoot = Join-Path $env:RUNNER_TEMP "stemflow-smoke"
+          $InputDir = Join-Path $SmokeRoot "input"
+          $OutputDir = Join-Path $SmokeRoot "output"
+          $env:PROGRAMDATA = Join-Path $SmokeRoot "programdata"
+          $DataDir = Join-Path $env:PROGRAMDATA "StemFlow"
+          New-Item -ItemType Directory -Force -Path $InputDir, $OutputDir, $DataDir |
+            Out-Null
+
+          $Ffmpeg = python -c `
+            "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          $SpeechWav = Join-Path $SmokeRoot "speech.wav"
+          Add-Type -AssemblyName System.Speech
+          $Synthesizer = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $Synthesizer.SetOutputToWaveFile($SpeechWav)
+          $Synthesizer.Speak(
+            "Stem Flow removes background music and keeps the spoken voice. " +
+            "This sentence verifies the packaged Windows inference engine."
+          )
+          $Synthesizer.Dispose()
+          & $Ffmpeg -hide_banner -loglevel error -y `
+            -f lavfi -i "color=c=black:s=320x240:r=25:d=8" `
+            -i $SpeechWav `
+            -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest `
+            (Join-Path $InputDir "smoke.mp4")
+
+          @{
+            input_dir = $InputDir
+            output_dir = $OutputDir
+            data_dir = $DataDir
+            model_dir = (Join-Path $DataDir "models")
+            work_dir = (Join-Path $DataDir "work")
+            log_dir = (Join-Path $DataDir "logs")
+            database_path = (Join-Path $DataDir "processing.db")
+            report_path = (Join-Path $DataDir "processing_status.xlsx")
+            model = "mdx"
+            stable_seconds = 0
+            worker_count = 1
+            schedule_time = "00:00"
+          } | ConvertTo-Json | Set-Content `
+            -Path (Join-Path $DataDir "config.json") `
+            -Encoding UTF8
+
+          $Process = Start-Process `
+            -FilePath ".\dist\StemFlow\StemFlow.exe" `
+            -ArgumentList "--run-scheduled" `
+            -Wait `
+            -PassThru
+          if ($Process.ExitCode -ne 0) {
+            Get-Content (Join-Path $DataDir "logs\stemflow-video.log") `
+              -ErrorAction SilentlyContinue
+            throw "Packaged StemFlow smoke test exited with $($Process.ExitCode)."
+          }
+          $Output = Join-Path $OutputDir "smoke_vocals_only.mp4"
+          if (-not (Test-Path $Output) -or (Get-Item $Output).Length -lt 1000) {
+            Get-Content (Join-Path $DataDir "logs\stemflow-video.log") `
+              -ErrorAction SilentlyContinue
+            throw "Packaged StemFlow did not create a valid vocals-only video."
+          }
+          & $Ffmpeg -hide_banner -loglevel error -i $Output -f null NUL
+
+      - name: Verify offline CUDA PyTorch assets
+        shell: powershell
+        run: |
+          $PythonBootstrap = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "python-3.12.10-embed-amd64.zip" |
+            Select-Object -First 1
+          $GetPip = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "get-pip.py" |
+            Select-Object -First 1
+          $GpuWorker = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "gpu_worker.py" |
+            Select-Object -First 1
+          $TorchWheel = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "torch-2.7.1+cu128-cp312-cp312-win_amd64.whl" |
+            Select-Object -First 1
+          $WheelManifest = Get-ChildItem .\dist\StemFlow -Recurse `
+            -Filter "wheelhouse-manifest.json" |
+            Select-Object -First 1
+          if (-not $PythonBootstrap -or $PythonBootstrap.Length -lt 10MB) {
+            throw "Embedded Python CUDA bootstrap is missing."
+          }
+          if (-not $GetPip -or -not $GpuWorker -or -not $WheelManifest) {
+            throw "Offline CUDA installer, manifest, or worker source is missing."
+          }
+          $GpuWorkerSource = Get-Content $GpuWorker.FullName -Raw
+          if ($GpuWorkerSource -notmatch "serve" -or `
+              $GpuWorkerSource -notmatch "load_model") {
+            throw "Persistent CUDA worker source is not packaged."
+          }
+          if (-not $TorchWheel -or $TorchWheel.Length -lt 3GB) {
+            throw "Offline CUDA PyTorch wheel is missing or unexpectedly small."
+          }
+
+      - name: Verify installer
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          $Installer = Get-ChildItem .\dist\installer\StemFlow-Setup-*-x64.exe |
+            Select-Object -First 1
+          $InstallerParts = @(Get-ChildItem `
+            .\dist\installer\StemFlow-Setup-*-x64* -File)
+          $TotalBytes = ($InstallerParts | Measure-Object Length -Sum).Sum
+          if (-not $Installer -or $InstallerParts.Count -lt 2) {
+            throw "Disk-spanning offline GPU installer is incomplete."
+          }
+          if ($TotalBytes -lt 3GB) {
+            throw "Offline GPU installer is unexpectedly small."
+          }
+          $Checksums = foreach ($Part in $InstallerParts) {
+            if ($Part.Length -gt 2GB) {
+              throw "Installer part exceeds GitHub Release limit: $($Part.Name)"
+            }
+            $Hash = (Get-FileHash $Part.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$Hash  $($Part.Name)"
+          }
+          $Checksums | Set-Content `
+            ".\dist\installer\StemFlow-$Version-SHA256SUMS.txt" `
+            -Encoding ascii
+
+      - name: Build lightweight updater
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          .\scripts\windows\build-gui-update.ps1 `
+            -Version $Version `
+            -SkipDependencyInstall `
+            -SkipAssetDownload
+
+      - name: Verify lightweight updater
+        shell: powershell
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          $Installer = Get-Item `
+            ".\dist\update\StemFlow-Update-$Version-x64.exe"
+          $Checksum = Get-Item "$($Installer.FullName).sha256"
+          if ($Installer.Length -lt 100MB -or $Installer.Length -gt 1GB) {
+            throw "Lightweight updater size is invalid: $($Installer.Length)"
+          }
+          $Wheel = Get-ChildItem .\dist-update\StemFlow -Recurse `
+            -Filter "torch-2.7.1+cu128-cp312-cp312-win_amd64.whl" |
+            Select-Object -First 1
+          if ($Wheel) {
+            throw "Lightweight updater must not contain the CUDA wheelhouse."
+          }
+          $Expected = (Get-Content $Checksum.FullName).Split()[0]
+          $Actual = (Get-FileHash $Installer.FullName -Algorithm SHA256).Hash
+          if ($Expected -ne $Actual) {
+            throw "Lightweight updater SHA256 mismatch."
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StemFlow-Windows-GUI-${{ env.APP_VERSION }}
+          path: |
+            dist/installer/StemFlow-Setup-*-x64*
+            dist/installer/StemFlow-*-SHA256SUMS.txt
+            dist/update/StemFlow-Update-*-x64.exe
+            dist/update/StemFlow-Update-*-x64.exe.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/gui-v')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $Version = "${env:APP_VERSION}" -replace '^gui-v', ''
+          $NotesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          @"
+          ## StemFlow $Version
+
+          ### 本版功能
+
+          - Excel 状态表改为后台合并写入，取消每个处理阶段同步全量导出造成的
+            GPU 空转和任务越多越慢问题；
+          - CUDA 推理增加 15 秒心跳、显存/利用率记录、持续 0% 检测，Worker
+            失联后自动重启并重试当前文件一次；
+          - 增加 HEALTH、GPU-HEALTH、PIPELINE、PERFORMANCE、REPORT 和
+            THROUGHPUT 诊断日志，可直接定位提取、GPU、合成或磁盘瓶颈；
+          - 运行日志按 25 MB 自动轮转，保留 8 份，并在界面增加“打开运行日志”。
+
+          ### 新用户：完整内置 GPU 版
+
+          下载 `StemFlow-Setup-$Version-x64.exe` 和全部同名 `.bin` 分卷，
+          放在同一文件夹后运行 EXE。安装包已经包含 CUDA 12.8 版
+          PyTorch、TorchAudio、TorchVision 和 ONNX Runtime GPU 离线资源。
+
+          ### 已安装用户：软件内更新
+
+          在 StemFlow 中点击“检查更新”。程序只下载
+          `StemFlow-Update-$Version-x64.exe`，不会重新下载、删除或安装
+          已有的 CUDA/PyTorch GPU 环境。
+
+          ### 完整性校验
+
+          Release 同时提供完整安装包校验清单，以及自动更新 EXE 的独立
+          SHA-256 文件。
+          "@ | Set-Content $NotesPath -Encoding UTF8
+
+          $Assets = @(
+            Get-ChildItem .\dist\installer\StemFlow-Setup-*-x64* -File
+            Get-ChildItem .\dist\installer\StemFlow-*-SHA256SUMS.txt -File
+            Get-ChildItem .\dist\update\StemFlow-Update-*-x64.exe -File
+            Get-ChildItem .\dist\update\StemFlow-Update-*-x64.exe.sha256 -File
+          ) | ForEach-Object { $_.FullName }
+
+          $SavedErrorAction = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          gh release view $env:GITHUB_REF_NAME *> $null
+          $ReleaseExists = $LASTEXITCODE -eq 0
+          $ErrorActionPreference = $SavedErrorAction
+
+          if ($ReleaseExists) {
+            gh release upload $env:GITHUB_REF_NAME $Assets --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME $Assets `
+              --title "StemFlow Windows GUI $Version" `
+              --notes-file $NotesPath
+          }
+          gh release edit $env:GITHUB_REF_NAME --latest

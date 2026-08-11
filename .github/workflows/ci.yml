@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lightweight test dependencies
+        run: python -m pip install "pytest>=8.3,<9" "XlsxWriter>=3.2,<4"
+      - name: Run tests
+        env:
+          PYTHONPATH: backend
+        run: python -m pytest -q backend/tests
+
+  powershell-syntax:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $Failed = $false
+          Get-ChildItem -Path . -Filter *.ps1 -Recurse | ForEach-Object {
+            $Tokens = $null
+            $Errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$Tokens,
+              [ref]$Errors
+            ) | Out-Null
+            foreach ($ParseError in $Errors) {
+              Write-Error "$($_.FullName): $($ParseError.Message)"
+              $Failed = $true
+            }
+          }
+          if ($Failed) {
+            exit 1
+          }

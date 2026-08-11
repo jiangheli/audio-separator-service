@@ -1,6 +1,10 @@
-import asyncio
-import shutil
+from __future__ import annotations
+
+import subprocess
 from pathlib import Path
+
+
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class AudioExtractionError(RuntimeError):
@@ -8,17 +12,12 @@ class AudioExtractionError(RuntimeError):
 
 
 class AudioExtractor:
-    def __init__(self, ffmpeg_binary: str = "ffmpeg") -> None:
+    def __init__(self, ffmpeg_binary: str) -> None:
         self.ffmpeg_binary = ffmpeg_binary
 
-    def available(self) -> bool:
-        return shutil.which(self.ffmpeg_binary) is not None
-
-    async def extract_audio(self, video_path: Path, target_path: Path) -> Path:
-        if not self.available():
-            raise AudioExtractionError("ffmpeg was not found. Install ffmpeg or use the Docker image.")
+    def extract_audio(self, video_path: Path, target_path: Path) -> Path:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        process = await asyncio.create_subprocess_exec(
+        command = [
             self.ffmpeg_binary,
             "-nostdin",
             "-hide_banner",
@@ -37,12 +36,17 @@ class AudioExtractor:
             "-ac",
             "2",
             str(target_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            creationflags=CREATE_NO_WINDOW,
+            check=False,
         )
-        _, stderr = await process.communicate()
-        if process.returncode != 0:
-            message = stderr.decode("utf-8", errors="replace").strip()
-            raise AudioExtractionError(f"ffmpeg could not extract audio from {video_path.name}: {message}")
+        if result.returncode != 0 or not target_path.is_file():
+            message = result.stderr.strip() or "the video has no readable audio track"
+            raise AudioExtractionError(
+                f"Could not extract audio from {video_path.name}: {message}"
+            )
         return target_path
-
