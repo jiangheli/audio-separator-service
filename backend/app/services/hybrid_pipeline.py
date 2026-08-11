@@ -4,6 +4,7 @@ import atexit
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import threading
@@ -48,6 +49,9 @@ class PersistentCudaWorker:
         self.segment_size = segment_size
         self.index = index
         self.process: subprocess.Popen[str] | None = None
+        self._output_queue: queue.Queue[str | None] = queue.Queue()
+        self._reader_thread: threading.Thread | None = None
+        self._recent_output: deque[str] = deque(maxlen=40)
         self._request_lock = threading.Lock()
         self._start_lock = threading.Lock()
 
@@ -89,7 +93,28 @@ class PersistentCudaWorker:
                 env=environment,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            event = self._read_event(logger, expected={"ready", "error"})
+            self._output_queue = queue.Queue()
+            self._recent_output.clear()
+            self._reader_thread = threading.Thread(
+                target=self._pump_output,
+                args=(self.process,),
+                daemon=True,
+                name=f"stemflow-cuda-output-{self.index}",
+            )
+            self._reader_thread.start()
+            try:
+                event = self._read_event(
+                    logger,
+                    expected={"ready", "error"},
+                    timeout_seconds=900,
+                )
+            except TimeoutError:
+                self.close()
+                raise RuntimeError(
+                    f"CUDA worker {self.index + 1} did not finish loading "
+                    "within 900 seconds. Reduce GPU concurrency, batch size, "
+                    "or segment size and retry."
+                ) from None
             if event.get("kind") != "ready":
                 self.close()
                 raise RuntimeError(
@@ -110,22 +135,51 @@ class PersistentCudaWorker:
                 float(event.get("device_total_gb", 0)),
             )
 
+    def _pump_output(self, process: subprocess.Popen[str]) -> None:
+        if process.stdout is None:
+            self._output_queue.put(None)
+            return
+        try:
+            for raw_line in process.stdout:
+                self._output_queue.put(raw_line.rstrip())
+        finally:
+            self._output_queue.put(None)
+
     def _read_event(
         self,
         logger: logging.Logger,
         *,
         expected: set[str],
         request_id: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, object]:
         process = self.process
-        if process is None or process.stdout is None:
+        if process is None:
             raise RuntimeError("Persistent CUDA worker is not running")
-        recent: deque[str] = deque(maxlen=40)
-        for raw_line in process.stdout:
-            line = raw_line.rstrip()
+        deadline = (
+            time.monotonic() + timeout_seconds
+            if timeout_seconds is not None
+            else None
+        )
+        while True:
+            timeout = None
+            if deadline is not None:
+                timeout = max(0.0, deadline - time.monotonic())
+                if timeout == 0:
+                    raise TimeoutError("CUDA worker event timed out")
+            try:
+                line = self._output_queue.get(timeout=timeout)
+            except queue.Empty:
+                raise TimeoutError("CUDA worker event timed out") from None
+            if line is None:
+                return_code = process.poll()
+                raise RuntimeError(
+                    f"Persistent CUDA worker exited with {return_code}: "
+                    + "\n".join(self._recent_output)
+                )
             if not line:
                 continue
-            recent.append(line)
+            self._recent_output.append(line)
             if not line.startswith(EVENT_PREFIX):
                 logger.info("CUDA[%s] | %s", self.index, line)
                 continue
@@ -142,11 +196,6 @@ class PersistentCudaWorker:
                 )
             ):
                 return event
-        return_code = process.poll()
-        raise RuntimeError(
-            f"Persistent CUDA worker exited with {return_code}: "
-            + "\n".join(recent)
-        )
 
     def separate(
         self,
@@ -251,10 +300,26 @@ class PersistentCudaPool:
         for index in close_indices:
             self._worker(index).close()
 
-    def warm(self, count: int, logger: logging.Logger) -> None:
+    def warm(self, count: int, logger: logging.Logger) -> int:
         self.set_size(count)
+        started = 0
         for index in range(max(1, count)):
-            self._worker(index).start(logger)
+            try:
+                self._worker(index).start(logger)
+                started += 1
+            except Exception as error:
+                if started == 0:
+                    raise
+                self.set_size(started)
+                logger.warning(
+                    "CUDA worker %s could not start (%s). Continuing with "
+                    "%s resident CUDA worker(s).",
+                    index + 1,
+                    error,
+                    started,
+                )
+                return started
+        return started
 
     def _retire_incompatible_workers(self) -> None:
         prefix = (str(self.python), str(self.model_dir), self.model)
@@ -389,9 +454,10 @@ class HybridVideoPipeline:
             self._cuda_pool.set_size(workers)
         return workers + self.prefetch + self.compose_threads
 
-    def warm_gpu(self, workers: int) -> None:
+    def warm_gpu(self, workers: int) -> int:
         if workers > 0 and self._cuda_pool is not None:
-            self._cuda_pool.warm(workers, self.logger)
+            return self._cuda_pool.warm(workers, self.logger)
+        return 0
 
     def process(
         self,

@@ -218,10 +218,13 @@ def execute(args: argparse.Namespace) -> int:
     repository = ProcessingRepository(config.database_path)
     if args.command == "status":
         value = {
-            "counts": repository.counts(),
+            "counts": repository.counts(config.input_dir),
             "recent_jobs": [
                 public_job(job)
-                for job in repository.list_jobs(max(1, min(args.limit, 1000)))
+                for job in repository.list_jobs(
+                    max(1, min(args.limit, 1000)),
+                    input_root=config.input_dir,
+                )
             ],
             "report_path": str(config.report_path),
             "log_path": str(config.log_dir / "stemflow-video.log"),
@@ -233,7 +236,7 @@ def execute(args: argparse.Namespace) -> int:
     if args.command == "report":
         report_path = ProcessingReport(config.report_path).export(
             config,
-            repository.list_jobs(),
+            repository.list_jobs(input_root=config.input_dir),
         )
         print_value(
             {"ok": True, "report_path": str(report_path)},

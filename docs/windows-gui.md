@@ -225,17 +225,17 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.7.0"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.7.1"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.7.0-x64.exe
-dist\installer\StemFlow-Setup-1.7.0-x64-1.bin
-dist\installer\StemFlow-Setup-1.7.0-x64-2.bin
-dist\update\StemFlow-Update-1.7.0-x64.exe
-dist\update\StemFlow-Update-1.7.0-x64.exe.sha256
+dist\installer\StemFlow-Setup-1.7.1-x64.exe
+dist\installer\StemFlow-Setup-1.7.1-x64-1.bin
+dist\installer\StemFlow-Setup-1.7.1-x64-2.bin
+dist\update\StemFlow-Update-1.7.1-x64.exe
+dist\update\StemFlow-Update-1.7.1-x64.exe.sha256
 ```
 
 也可以推送 `gui-v<版本>` 标签触发 GitHub Actions。标签构建成功后会自动创建

@@ -111,13 +111,6 @@ class BatchRunner:
         self.config.prepare_directories()
         lock_path = self.config.data_dir / "stemflow-video.lock"
         with ProcessLock(lock_path):
-            recovered = self.repository.recover_interrupted()
-            if recovered:
-                self.logger.warning(
-                    "Recovered %s interrupted job(s) and marked them for retry",
-                    recovered,
-                )
-
             videos = scan_videos(
                 self.config.input_dir,
                 recursive=self.config.recursive,
@@ -129,6 +122,7 @@ class BatchRunner:
             )
             discovered = 0
             waiting_copy = 0
+            existing_job_ids: list[str] = []
             for video in videos:
                 fingerprint = file_fingerprint(video)
                 record = self.repository.get_by_fingerprint(fingerprint)
@@ -144,12 +138,14 @@ class BatchRunner:
                             self.config.output_suffix,
                         ),
                         status="pending" if stable else "waiting_copy",
+                        input_root=self.config.input_dir,
                     )
                     discovered += 1
                     if not stable:
                         waiting_copy += 1
                     continue
 
+                existing_job_ids.append(str(record["id"]))
                 if record["status"] == "waiting_copy":
                     if stable:
                         self.repository.mark_ready(record["id"])
@@ -159,7 +155,27 @@ class BatchRunner:
                     if not Path(record["output_path"]).is_file():
                         self.repository.reset_for_rebuild(record["id"])
 
-            jobs = self.repository.eligible(self.config.max_retries)
+            # A single transaction keeps first-run migration fast even for
+            # libraries containing tens of thousands of videos.
+            self.repository.assign_input_root_many(
+                existing_job_ids,
+                self.config.input_dir,
+            )
+
+            recovered = self.repository.recover_interrupted(
+                self.config.input_dir
+            )
+            if recovered:
+                self.logger.warning(
+                    "Recovered %s interrupted job(s) in the selected input "
+                    "folder and marked them for retry",
+                    recovered,
+                )
+
+            jobs = self.repository.eligible(
+                self.config.max_retries,
+                self.config.input_dir,
+            )
             if max_files > 0:
                 jobs = jobs[:max_files]
 
@@ -190,7 +206,24 @@ class BatchRunner:
                     "Warming %s persistent CUDA worker(s) before the batch",
                     gpu_workers,
                 )
-                warm_gpu(gpu_workers)
+                warmed = warm_gpu(gpu_workers)
+                if (
+                    isinstance(warmed, int)
+                    and 0 < warmed < gpu_workers
+                ):
+                    cpu_workers, _requested_gpu_workers = (
+                        controller.get_allocation()
+                    )
+                    controller.set_allocation(
+                        cpu_workers=cpu_workers,
+                        gpu_workers=warmed,
+                    )
+                    self.logger.warning(
+                        "GPU concurrency was reduced from %s to %s because "
+                        "the requested resident models did not fit or start",
+                        gpu_workers,
+                        warmed,
+                    )
             outcomes = self._run_jobs(
                 jobs,
                 controller=controller,
@@ -209,7 +242,9 @@ class BatchRunner:
             ):
                 _cpu_workers, gpu_workers = controller.get_allocation()
                 collections = self.concatenator.concatenate_completed(
-                    self.repository.list_jobs(),
+                    self.repository.list_jobs(
+                        input_root=self.config.input_dir
+                    ),
                     input_root=self.config.input_dir,
                     output_root=self.config.output_dir,
                     output_suffix=self.config.output_suffix,
@@ -244,7 +279,7 @@ class BatchRunner:
                             collection.output,
                         )
 
-            summary["counts"] = self.repository.counts()
+            summary["counts"] = self.repository.counts(self.config.input_dir)
             self.logger.info(
                 "Batch finished: %s completed, %s failed",
                 summary["completed"],
@@ -403,7 +438,12 @@ class BatchRunner:
     def _refresh_report(self) -> None:
         with self._report_lock:
             try:
-                self.report.export(self.config, self.repository.list_jobs())
+                self.report.export(
+                    self.config,
+                    self.repository.list_jobs(
+                        input_root=self.config.input_dir
+                    ),
+                )
             except OSError as error:
                 self.logger.warning(
                     "Could not update Excel report (close it in Excel and retry): %s",

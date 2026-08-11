@@ -644,7 +644,7 @@ class StemFlowGUI:
             table_frame,
             columns=columns,
             show="headings",
-            height=9,
+            height=4,
         )
         self.jobs.heading("status", text="状态")
         self.jobs.heading("file", text="文件")
@@ -674,7 +674,7 @@ class StemFlowGUI:
         log_frame.pack(fill="both", pady=(12, 0))
         self.log = ScrolledText(
             log_frame,
-            height=7,
+            height=3,
             wrap="word",
             state="disabled",
             font=("Consolas", 9),
@@ -1200,7 +1200,14 @@ class StemFlowGUI:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
-                    self._append_log(str(payload))
+                    line = str(payload)
+                    self._append_log(line)
+                    if "Scan complete:" in line:
+                        self.status_var.set("扫描完成，正在准备任务…")
+                    elif "Warming " in line and "CUDA worker" in line:
+                        self.status_var.set("正在加载 CUDA 常驻模型…")
+                    elif "CUDA worker" in line and " ready;" in line:
+                        self.status_var.set("CUDA 模型已加载，正在处理…")
                 elif kind == "cuda-progress":
                     line = str(payload)
                     self.status_var.set(line)
@@ -1318,8 +1325,11 @@ class StemFlowGUI:
         try:
             config = service_config(self._current_settings())
             repository = ProcessingRepository(config.database_path)
-            records = repository.list_jobs(100)
-            counts = repository.counts()
+            records = repository.list_jobs(
+                100,
+                input_root=config.input_dir,
+            )
+            counts = repository.counts(config.input_dir)
         except Exception:
             return
 

@@ -77,3 +77,48 @@ def test_new_fingerprint_supersedes_unprocessed_source_version(tmp_path: Path) -
     superseded = repository.get(old["id"])
     assert superseded is not None
     assert superseded["status"] == "superseded"
+
+
+def test_repository_scopes_jobs_to_selected_input_folder(tmp_path: Path) -> None:
+    repository = ProcessingRepository(tmp_path / "processing.db")
+    roots = (tmp_path / "input-a", tmp_path / "input-b")
+    jobs = []
+    for index, root in enumerate(roots):
+        source = root / f"episode-{index}.mp4"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"video")
+        stat = source.stat()
+        video = VideoFile(
+            source,
+            Path(source.name),
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+        jobs.append(
+            repository.register(
+                video,
+                fingerprint=f"fingerprint-{index}",
+                model="mdx",
+                output_path=tmp_path / "output" / source.name,
+                status="pending",
+                input_root=root,
+            )
+        )
+
+    assert [job["id"] for job in repository.eligible(3, roots[0])] == [
+        jobs[0]["id"]
+    ]
+    assert [job["id"] for job in repository.list_jobs(input_root=roots[1])] == [
+        jobs[1]["id"]
+    ]
+    assert repository.counts(roots[0]) == {"pending": 1, "total": 1}
+
+    repository.assign_input_root_many([jobs[0]["id"]], roots[1])
+    assert repository.counts(roots[0]) == {"total": 0}
+    assert repository.counts(roots[1]) == {"pending": 2, "total": 2}
+    repository.assign_input_root(jobs[0]["id"], roots[0])
+
+    repository.claim(jobs[0]["id"], max_retries=3)
+    repository.update(jobs[0]["id"], status="separating_vocals")
+    assert repository.recover_interrupted(roots[1]) == 0
+    assert repository.recover_interrupted(roots[0]) == 1

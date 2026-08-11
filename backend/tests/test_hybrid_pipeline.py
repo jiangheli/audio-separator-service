@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from app.models import VideoProcessResult
-from app.services.hybrid_pipeline import HybridVideoPipeline
+from app.services.hybrid_pipeline import (
+    HybridVideoPipeline,
+    PersistentCudaPool,
+    PersistentCudaWorker,
+)
 
 
 class FakeExtractor:
@@ -145,8 +152,6 @@ def test_hybrid_pipeline_runs_three_stages_and_reuses_pool(tmp_path: Path) -> No
 
 
 def test_cuda_worker_command_contains_gpu_tuning(tmp_path: Path) -> None:
-    from app.services.hybrid_pipeline import PersistentCudaWorker
-
     worker = PersistentCudaWorker(
         tmp_path / "python.exe",
         model_dir=tmp_path / "models",
@@ -162,3 +167,58 @@ def test_cuda_worker_command_contains_gpu_tuning(tmp_path: Path) -> None:
 
     assert command[command.index("--batch-size") + 1] == "3"
     assert command[command.index("--segment-size") + 1] == "256"
+
+
+def test_cuda_worker_event_read_has_a_timeout(tmp_path: Path) -> None:
+    worker = PersistentCudaWorker(
+        tmp_path / "python.exe",
+        model_dir=tmp_path / "models",
+        work_root=tmp_path / "work",
+        model="mdx.onnx",
+        cpu_threads=4,
+        batch_size=1,
+        segment_size=256,
+        index=0,
+    )
+    worker.process = SimpleNamespace(poll=lambda: None)  # type: ignore[assignment]
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        worker._read_event(
+            logging.getLogger("test-cuda-timeout"),
+            expected={"ready"},
+            timeout_seconds=0.01,
+        )
+
+
+def test_cuda_pool_keeps_started_workers_when_next_worker_fails(
+    tmp_path: Path,
+) -> None:
+    class FakeWorker:
+        def __init__(self, fails: bool = False) -> None:
+            self.fails = fails
+            self.closed = False
+
+        def start(self, _logger: logging.Logger) -> None:
+            if self.fails:
+                raise RuntimeError("CUDA out of memory")
+
+        def close(self) -> None:
+            self.closed = True
+
+    pool = PersistentCudaPool(
+        tmp_path / "python.exe",
+        model_dir=tmp_path / "models",
+        work_root=tmp_path / "work",
+        model="mdx.onnx",
+        cpu_threads=4,
+        batch_size=2,
+        segment_size=256,
+    )
+    workers = [FakeWorker(), FakeWorker(fails=True)]
+    pool._worker = lambda index: workers[index]  # type: ignore[method-assign]
+
+    warmed = pool.warm(2, logging.getLogger("test-cuda-pool-fallback"))
+
+    assert warmed == 1
+    assert pool._size == 1
+    assert workers[1].closed is True

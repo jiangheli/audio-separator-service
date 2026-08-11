@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import uuid
@@ -16,6 +17,10 @@ ACTIVE_STATUSES = {
     "separating_vocals",
     "composing_video",
 }
+
+
+def normalized_input_root(path: str | Path) -> str:
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
 
 
 def utcnow() -> str:
@@ -59,6 +64,7 @@ class ProcessingRepository:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     model TEXT NOT NULL,
                     device TEXT,
+                    input_root TEXT,
                     output_path TEXT NOT NULL,
                     duration_seconds REAL,
                     used_video_copy INTEGER,
@@ -75,9 +81,25 @@ class ProcessingRepository:
             }
             if "device" not in columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN device TEXT")
+            if "input_root" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN input_root TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_root_status "
+                "ON jobs(input_root, status)"
+            )
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self, input_root: str | Path | None = None) -> int:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        scope = " AND input_root=?" if input_root is not None else ""
+        params: tuple[Any, ...] = (
+            utcnow(),
+            *sorted(ACTIVE_STATUSES),
+            *(
+                (normalized_input_root(input_root),)
+                if input_root is not None
+                else ()
+            ),
+        )
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
                 f"""
@@ -85,9 +107,9 @@ class ProcessingRepository:
                 SET status='failed',
                     finished_at=?,
                     error='Previous process stopped before this job completed'
-                WHERE status IN ({placeholders})
+                WHERE status IN ({placeholders}){scope}
                 """,
-                (utcnow(), *sorted(ACTIVE_STATUSES)),
+                params,
             )
             return cursor.rowcount
 
@@ -107,7 +129,13 @@ class ProcessingRepository:
         model: str,
         output_path: Path,
         status: str,
+        input_root: str | Path | None = None,
     ) -> dict[str, Any]:
+        root_value = (
+            normalized_input_root(input_root)
+            if input_root is not None
+            else None
+        )
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -125,8 +153,8 @@ class ProcessingRepository:
                 """
                 INSERT OR IGNORE INTO jobs (
                     id, fingerprint, source_path, relative_path, size, mtime_ns,
-                    detected_at, status, model, output_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    detected_at, status, model, input_root, output_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     uuid.uuid4().hex,
@@ -138,9 +166,15 @@ class ProcessingRepository:
                     utcnow(),
                     status,
                     model,
+                    root_value,
                     str(output_path),
                 ),
             )
+            if root_value is not None:
+                connection.execute(
+                    "UPDATE jobs SET input_root=? WHERE fingerprint=?",
+                    (root_value, fingerprint),
+                )
             row = connection.execute(
                 "SELECT * FROM jobs WHERE fingerprint=?",
                 (fingerprint,),
@@ -148,6 +182,27 @@ class ProcessingRepository:
         if row is None:
             raise RuntimeError("Could not register video job")
         return dict(row)
+
+    def assign_input_root(self, job_id: str, input_root: str | Path) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET input_root=? WHERE id=?",
+                (normalized_input_root(input_root), job_id),
+            )
+
+    def assign_input_root_many(
+        self,
+        job_ids: list[str],
+        input_root: str | Path,
+    ) -> None:
+        if not job_ids:
+            return
+        root = normalized_input_root(input_root)
+        with self._lock, self._connect() as connection:
+            connection.executemany(
+                "UPDATE jobs SET input_root=? WHERE id=?",
+                ((root, job_id) for job_id in job_ids),
+            )
 
     def mark_ready(self, job_id: str) -> None:
         with self._lock, self._connect() as connection:
@@ -242,32 +297,67 @@ class ProcessingRepository:
             ).fetchone()
         return dict(row) if row else None
 
-    def eligible(self, max_retries: int) -> list[dict[str, Any]]:
+    def eligible(
+        self,
+        max_retries: int,
+        input_root: str | Path | None = None,
+    ) -> list[dict[str, Any]]:
         maximum_attempts = max_retries + 1
+        scope = " AND input_root=?" if input_root is not None else ""
+        params: tuple[Any, ...] = (
+            maximum_attempts,
+            *(
+                (normalized_input_root(input_root),)
+                if input_root is not None
+                else ()
+            ),
+        )
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM jobs
                 WHERE status IN ('pending', 'failed')
                   AND attempts < ?
+                  {scope}
                 ORDER BY detected_at ASC
                 """,
-                (maximum_attempts,),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_jobs(self, limit: int = 10000) -> list[dict[str, Any]]:
+    def list_jobs(
+        self,
+        limit: int = 10000,
+        input_root: str | Path | None = None,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE input_root=?" if input_root is not None else ""
+        params: tuple[Any, ...] = (
+            *(
+                (normalized_input_root(input_root),)
+                if input_root is not None
+                else ()
+            ),
+            limit,
+        )
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs ORDER BY detected_at DESC LIMIT ?",
-                (limit,),
+                f"SELECT * FROM jobs {where} ORDER BY detected_at DESC LIMIT ?",
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, input_root: str | Path | None = None) -> dict[str, int]:
+        where = "WHERE input_root=?" if input_root is not None else ""
+        params = (
+            (normalized_input_root(input_root),)
+            if input_root is not None
+            else ()
+        )
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT status, COUNT(*) AS count FROM jobs GROUP BY status"
+                f"SELECT status, COUNT(*) AS count FROM jobs {where} "
+                "GROUP BY status",
+                params,
             ).fetchall()
         counts = {str(row["status"]): int(row["count"]) for row in rows}
         counts["total"] = sum(counts.values())

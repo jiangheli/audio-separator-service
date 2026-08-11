@@ -351,3 +351,79 @@ def test_runner_builds_folder_collections_after_processing(tmp_path: Path) -> No
     assert summary["collections_completed"] == 1
     assert summary["collections_failed"] == 0
     assert len(concatenator.jobs) == 2
+
+
+def test_runner_does_not_process_jobs_from_previous_input_folder(
+    tmp_path: Path,
+) -> None:
+    first_config = make_config(tmp_path)
+    first_config.prepare_directories()
+    first_source = first_config.input_dir / "old.mp4"
+    first_source.write_bytes(b"old")
+    repository = ProcessingRepository(first_config.database_path)
+    stopped = threading.Event()
+    stopped.set()
+    BatchRunner(
+        first_config,
+        repository,
+        FakePipeline(),
+        ProcessingReport(first_config.report_path),
+        logging.getLogger("test-first-root"),
+    ).run_once(stop_event=stopped)
+
+    second_config = ServiceConfig.from_mapping(
+        {
+            "input_dir": str(tmp_path / "input-2"),
+            "output_dir": str(tmp_path / "output-2"),
+            "data_dir": str(tmp_path / "data"),
+            "stable_seconds": 0,
+            "model": "mdx",
+        },
+        base=tmp_path,
+    )
+    second_config.prepare_directories()
+    (second_config.input_dir / "new.mp4").write_bytes(b"new")
+    pipeline = FakePipeline()
+    summary = BatchRunner(
+        second_config,
+        repository,
+        pipeline,
+        ProcessingReport(second_config.report_path),
+        logging.getLogger("test-second-root"),
+    ).run_once()
+
+    assert summary["scanned"] == 1
+    assert summary["queued"] == 1
+    assert summary["completed"] == 1
+    assert pipeline.calls == 1
+    assert repository.counts(first_config.input_dir)["pending"] == 1
+    assert repository.counts(second_config.input_dir)["completed"] == 1
+
+
+def test_runner_reduces_gpu_allocation_when_warmup_falls_back(
+    tmp_path: Path,
+) -> None:
+    class FallbackGpuPipeline(FakePipeline):
+        def warm_gpu(self, workers: int) -> int:
+            assert workers == 2
+            return 1
+
+    config = make_config(tmp_path)
+    config.prepare_directories()
+    (config.input_dir / "episode.mp4").write_bytes(b"video")
+    repository = ProcessingRepository(config.database_path)
+    pipeline = FallbackGpuPipeline()
+    controller = ConcurrencyController(1)
+    controller.set_allocation(cpu_workers=0, gpu_workers=2)
+
+    summary = BatchRunner(
+        config,
+        repository,
+        pipeline,
+        ProcessingReport(config.report_path),
+        logging.getLogger("test-gpu-warm-fallback"),
+    ).run_once(concurrency=controller)
+
+    assert summary["completed"] == 1
+    assert controller.get_allocation() == (0, 1)
+    assert pipeline.devices == ["cuda"]
