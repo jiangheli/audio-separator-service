@@ -9,7 +9,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: "1.7.1"
+        default: "1.8.0"
   push:
     tags:
       - "gui-v*"
@@ -214,11 +214,13 @@ jobs:
 
           ### 本版功能
 
-          - 修复切换输入文件夹后仍混入历史目录任务的问题；
-          - 修复多个 CUDA 常驻 Worker 启动失败时批次无限等待的问题，
-            显存不足时会保留已启动 Worker 并自动降低 GPU 并发；
-          - 缩短任务表格，让运行日志始终可见，并显示扫描、CUDA 模型加载状态；
-          - 首次升级会自动迁移现有任务记录，无需删除数据库或重新处理已完成视频。
+          - Excel 状态表改为后台合并写入，取消每个处理阶段同步全量导出造成的
+            GPU 空转和任务越多越慢问题；
+          - CUDA 推理增加 15 秒心跳、显存/利用率记录、持续 0% 检测，Worker
+            失联后自动重启并重试当前文件一次；
+          - 增加 HEALTH、GPU-HEALTH、PIPELINE、PERFORMANCE、REPORT 和
+            THROUGHPUT 诊断日志，可直接定位提取、GPU、合成或磁盘瓶颈；
+          - 运行日志按 25 MB 自动轮转，保留 8 份，并在界面增加“打开运行日志”。
 
           ### 新用户：完整内置 GPU 版
 

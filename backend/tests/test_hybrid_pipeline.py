@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,6 +152,9 @@ def test_hybrid_pipeline_runs_three_stages_and_reuses_pool(tmp_path: Path) -> No
         "completed",
     ] * 2
     assert pipeline.scheduling_target("cuda", 1) == 5
+    performance = pipeline.performance_summary()
+    assert performance["gpu_jobs"] == 2
+    assert "bottleneck" in performance
 
 
 def test_cuda_worker_command_contains_gpu_tuning(tmp_path: Path) -> None:
@@ -188,6 +194,150 @@ def test_cuda_worker_event_read_has_a_timeout(tmp_path: Path) -> None:
             expected={"ready"},
             timeout_seconds=0.01,
         )
+
+
+def test_cuda_heartbeat_extends_inactivity_timeout(tmp_path: Path) -> None:
+    from app.services.hybrid_pipeline import EVENT_PREFIX
+
+    worker = PersistentCudaWorker(
+        tmp_path / "python.exe",
+        model_dir=tmp_path / "models",
+        work_root=tmp_path / "work",
+        model="mdx.onnx",
+        cpu_threads=4,
+        batch_size=1,
+        segment_size=256,
+        index=0,
+    )
+    worker.process = SimpleNamespace(poll=lambda: None)  # type: ignore[assignment]
+
+    def send_events() -> None:
+        time.sleep(0.03)
+        worker._output_queue.put(
+            EVENT_PREFIX
+            + json.dumps(
+                {
+                    "kind": "heartbeat",
+                    "request_id": "request",
+                    "elapsed_seconds": 10,
+                    "gpu_utilization": 80,
+                    "memory_used_gb": 5,
+                }
+            )
+        )
+        time.sleep(0.03)
+        worker._output_queue.put(
+            EVENT_PREFIX
+            + json.dumps(
+                {
+                    "kind": "result",
+                    "request_id": "request",
+                    "vocals": "vocals.wav",
+                }
+            )
+        )
+
+    thread = threading.Thread(target=send_events)
+    thread.start()
+    event = worker._read_event(
+        logging.getLogger("test-cuda-heartbeat"),
+        expected={"result"},
+        request_id="request",
+        timeout_seconds=0.04,
+        reset_timeout_on_activity=True,
+    )
+    thread.join(timeout=1)
+
+    assert event["kind"] == "result"
+    assert worker.diagnostics()["last_gpu_utilization"] == 80
+
+
+def test_cuda_zero_utilization_is_detected_as_a_stall(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import app.services.hybrid_pipeline as hybrid_pipeline
+
+    monkeypatch.setattr(
+        hybrid_pipeline,
+        "GPU_ZERO_UTILIZATION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    worker = PersistentCudaWorker(
+        tmp_path / "python.exe",
+        model_dir=tmp_path / "models",
+        work_root=tmp_path / "work",
+        model="mdx.onnx",
+        cpu_threads=4,
+        batch_size=1,
+        segment_size=256,
+        index=0,
+    )
+    worker.process = SimpleNamespace(poll=lambda: None)  # type: ignore[assignment]
+    def heartbeat() -> str:
+        return hybrid_pipeline.EVENT_PREFIX + json.dumps(
+            {
+                "kind": "heartbeat",
+                "request_id": "request",
+                "elapsed_seconds": 10,
+                "gpu_utilization": 0,
+                "memory_used_gb": 5,
+            }
+        )
+    worker._output_queue.put(heartbeat())
+
+    def send_second_heartbeat() -> None:
+        time.sleep(0.02)
+        worker._output_queue.put(heartbeat())
+
+    thread = threading.Thread(target=send_second_heartbeat)
+    thread.start()
+    with pytest.raises(TimeoutError, match="0% utilization"):
+        worker._read_event(
+            logging.getLogger("test-cuda-zero-utilization"),
+            expected={"result"},
+            request_id="request",
+            timeout_seconds=0.1,
+            reset_timeout_on_activity=True,
+        )
+    thread.join(timeout=1)
+
+
+def test_cuda_request_restarts_once_after_transport_timeout(
+    tmp_path: Path,
+) -> None:
+    worker = PersistentCudaWorker(
+        tmp_path / "python.exe",
+        model_dir=tmp_path / "models",
+        work_root=tmp_path / "work",
+        model="mdx.onnx",
+        cpu_threads=4,
+        batch_size=1,
+        segment_size=256,
+        index=0,
+    )
+    calls = 0
+
+    def separate_once(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("no heartbeat")
+        vocals = tmp_path / "vocals.wav"
+        vocals.write_bytes(b"vocals")
+        return vocals, {"kind": "result"}
+
+    worker._separate_once = separate_once  # type: ignore[method-assign]
+    vocals, _metrics = worker.separate(
+        tmp_path / "source.wav",
+        tmp_path / "separated",
+        "mdx.onnx",
+        logging.getLogger("test-cuda-recovery"),
+    )
+
+    assert vocals.read_bytes() == b"vocals"
+    assert calls == 2
+    assert worker.diagnostics()["restarts"] == 1
 
 
 def test_cuda_pool_keeps_started_workers_when_next_worker_fails(

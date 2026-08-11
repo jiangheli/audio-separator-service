@@ -427,3 +427,34 @@ def test_runner_reduces_gpu_allocation_when_warmup_falls_back(
     assert summary["completed"] == 1
     assert controller.get_allocation() == (0, 1)
     assert pipeline.devices == ["cuda"]
+
+
+def test_runner_coalesces_excel_exports_instead_of_blocking_every_stage(
+    tmp_path: Path,
+) -> None:
+    class CountingReport:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def export(self, _config, _jobs):
+            with self.lock:
+                self.calls += 1
+            time.sleep(0.05)
+            return tmp_path / "report.xlsx"
+
+    config = make_config(tmp_path)
+    config.prepare_directories()
+    for index in range(8):
+        (config.input_dir / f"episode-{index}.mp4").write_bytes(b"video")
+    report = CountingReport()
+    summary = BatchRunner(
+        config,
+        ProcessingRepository(config.database_path),
+        FakePipeline(),
+        report,  # type: ignore[arg-type]
+        logging.getLogger("test-async-report"),
+    ).run_once(max_workers=4)
+
+    assert summary["completed"] == 8
+    assert 1 <= report.calls <= 2

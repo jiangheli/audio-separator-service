@@ -631,6 +631,11 @@ class StemFlowGUI:
             text="打开输出文件夹",
             command=lambda: open_path(Path(self.output_var.get())),
         ).pack(side="left", padx=8)
+        ttk.Button(
+            actions,
+            text="打开运行日志",
+            command=lambda: open_path(program_data_dir() / "logs"),
+        ).pack(side="left", padx=8)
         ttk.Label(actions, textvariable=self.status_var, style="Status.TLabel").pack(
             side="right"
         )
@@ -1208,6 +1213,12 @@ class StemFlowGUI:
                         self.status_var.set("正在加载 CUDA 常驻模型…")
                     elif "CUDA worker" in line and " ready;" in line:
                         self.status_var.set("CUDA 模型已加载，正在处理…")
+                    elif "GPU-HEALTH" in line:
+                        self.status_var.set("GPU 正在推理，心跳正常")
+                    elif "GPU-RECOVERY" in line:
+                        self.status_var.set("GPU Worker 异常，正在自动恢复…")
+                    elif "STALL-ANALYSIS" in line:
+                        self.status_var.set("检测到长时间无完成任务，请查看运行日志")
                 elif kind == "cuda-progress":
                     line = str(payload)
                     self.status_var.set(line)

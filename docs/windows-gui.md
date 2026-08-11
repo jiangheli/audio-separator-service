@@ -207,6 +207,17 @@ C:\ProgramData\StemFlow\
 └── work\
 ```
 
+点击界面的“打开运行日志”可直接打开 `logs` 目录。主日志
+`stemflow-video.log` 达到 25 MB 后自动轮转，最多保留 8 份历史日志，避免长期
+批处理耗尽系统盘。诊断时重点搜索以下标记：
+
+- `HEALTH`：当前队列、流水线阶段和常驻 Worker 状态；
+- `GPU-HEALTH`：CUDA 利用率、显存、当前文件和推理时长；
+- `GPU-RECOVERY`：GPU 停滞后的自动重启与重试；
+- `PIPELINE`：音频提取、GPU 等待/推理和视频合成分段耗时；
+- `PERFORMANCE`、`THROUGHPUT`：批次瓶颈分析和每分钟完成量；
+- `REPORT`：Excel 状态表后台合并写入耗时。
+
 卸载程序不会删除处理结果。若要彻底清除运行历史，可在卸载后手工删除
 `C:\ProgramData\StemFlow`。
 
@@ -225,17 +236,18 @@ C:\ProgramData\StemFlow\
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scripts\windows\build-gui-installer.ps1 -Version "1.7.1"
+.\scripts\windows\build-gui-installer.ps1 -Version "1.8.0"
 ```
 
 生成文件：
 
 ```text
-dist\installer\StemFlow-Setup-1.7.1-x64.exe
-dist\installer\StemFlow-Setup-1.7.1-x64-1.bin
-dist\installer\StemFlow-Setup-1.7.1-x64-2.bin
-dist\update\StemFlow-Update-1.7.1-x64.exe
-dist\update\StemFlow-Update-1.7.1-x64.exe.sha256
+dist\installer\StemFlow-Setup-1.8.0-x64.exe
+dist\installer\StemFlow-Setup-1.8.0-x64-1.bin
+dist\installer\StemFlow-Setup-1.8.0-x64-2.bin
+dist\installer\StemFlow-Setup-1.8.0-x64-3.bin
+dist\update\StemFlow-Update-1.8.0-x64.exe
+dist\update\StemFlow-Update-1.8.0-x64.exe.sha256
 ```
 
 也可以推送 `gui-v<版本>` 标签触发 GitHub Actions。标签构建成功后会自动创建

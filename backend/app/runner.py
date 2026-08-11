@@ -5,7 +5,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.config import ServiceConfig
 from app.process_lock import ProcessLock
@@ -19,6 +19,102 @@ from app.services.scanner import (
 )
 from app.services.concatenator import FolderVideoConcatenator
 from app.services.video_pipeline import VideoBgmRemovalPipeline
+
+
+class AsyncReportWriter:
+    """Coalesce expensive full-workbook exports away from inference threads."""
+
+    def __init__(
+        self,
+        exporter: Callable[[], int],
+        logger: logging.Logger,
+        *,
+        minimum_interval_seconds: float = 60.0,
+    ) -> None:
+        self.exporter = exporter
+        self.logger = logger
+        self.minimum_interval_seconds = max(0.0, minimum_interval_seconds)
+        self._condition = threading.Condition()
+        self._requested_generation = 0
+        self._completed_generation = 0
+        self._force_generation = 0
+        # Do not compete with model warm-up and initial audio extraction.
+        self._last_export_at = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="stemflow-report-writer",
+        )
+        self._thread.start()
+
+    def request(self, *, force: bool = False) -> int:
+        with self._condition:
+            self._requested_generation += 1
+            generation = self._requested_generation
+            if force:
+                self._force_generation = max(
+                    self._force_generation,
+                    generation,
+                )
+            self._condition.notify_all()
+            return generation
+
+    def flush(self, timeout_seconds: float = 300.0) -> bool:
+        target = self.request(force=True)
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while self._completed_generation < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.logger.warning(
+                        "REPORT | final workbook export did not finish within %.0fs",
+                        timeout_seconds,
+                    )
+                    return False
+                self._condition.wait(timeout=remaining)
+        return True
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._requested_generation <= self._completed_generation:
+                    self._condition.wait()
+                generation = self._requested_generation
+                forced = self._force_generation > self._completed_generation
+                delay = (
+                    self._last_export_at
+                    + self.minimum_interval_seconds
+                    - time.monotonic()
+                )
+                if delay > 0 and not forced:
+                    self._condition.wait(timeout=delay)
+                    continue
+
+            started = time.monotonic()
+            rows = 0
+            try:
+                rows = self.exporter()
+                self.logger.info(
+                    "REPORT | exported %s row(s) in %.1fs; updates were coalesced",
+                    rows,
+                    time.monotonic() - started,
+                )
+            except OSError as error:
+                self.logger.warning(
+                    "REPORT | could not update Excel workbook "
+                    "(close it in Excel and retry): %s",
+                    error,
+                )
+            except Exception:
+                self.logger.exception("REPORT | background workbook export failed")
+            finally:
+                with self._condition:
+                    self._completed_generation = max(
+                        self._completed_generation,
+                        generation,
+                    )
+                    self._last_export_at = time.monotonic()
+                    self._condition.notify_all()
 
 
 class ConcurrencyController:
@@ -91,7 +187,10 @@ class BatchRunner:
         self.report = report
         self.logger = logger
         self.concatenator = concatenator
-        self._report_lock = threading.Lock()
+        self._report_writer = AsyncReportWriter(
+            self._export_report,
+            logger,
+        )
 
     def run_once(
         self,
@@ -233,6 +332,15 @@ class BatchRunner:
 
             summary["completed"] = outcomes.count("completed")
             summary["failed"] = outcomes.count("failed")
+            performance_reader = getattr(
+                self.pipeline,
+                "performance_summary",
+                None,
+            )
+            if callable(performance_reader):
+                performance = performance_reader()
+                summary["performance"] = performance
+                self.logger.info("PERFORMANCE | %s", performance)
             summary["collections_completed"] = 0
             summary["collections_failed"] = 0
             if (
@@ -285,6 +393,7 @@ class BatchRunner:
                 summary["completed"],
                 summary["failed"],
             )
+            self._refresh_report(wait=True)
             return summary
 
     def _run_jobs(
@@ -301,6 +410,10 @@ class BatchRunner:
         outcomes: list[str] = []
         next_job = 0
         active: dict[Future[str], str] = {}
+        batch_started = time.monotonic()
+        last_health_log = 0.0
+        last_completion_at = batch_started
+        last_stall_warning = 0.0
         executor_capacity = controller.maximum or max(1, len(jobs))
         with ThreadPoolExecutor(
             max_workers=executor_capacity,
@@ -338,6 +451,48 @@ class BatchRunner:
                         next_job += 1
                         current += 1
 
+                now = time.monotonic()
+                active_cpu = sum(device == "cpu" for device in active.values())
+                active_gpu = sum(device == "cuda" for device in active.values())
+                if now - last_health_log >= 15.0:
+                    diagnostics_reader = getattr(
+                        self.pipeline,
+                        "diagnostics_snapshot",
+                        None,
+                    )
+                    diagnostics = (
+                        diagnostics_reader()
+                        if callable(diagnostics_reader)
+                        else None
+                    )
+                    self.logger.info(
+                        "HEALTH | submitted=%s/%s; waiting=%s; "
+                        "routed CPU/GPU=%s/%s; pipeline slots CPU/GPU=%s/%s; "
+                        "seconds_since_completion=%.1f; pipeline=%s",
+                        next_job,
+                        len(jobs),
+                        len(jobs) - next_job,
+                        active_cpu,
+                        active_gpu,
+                        cpu_target,
+                        gpu_target,
+                        now - last_completion_at,
+                        diagnostics,
+                    )
+                    last_health_log = now
+                if (
+                    active
+                    and now - last_completion_at >= 300.0
+                    and now - last_stall_warning >= 60.0
+                ):
+                    self.logger.warning(
+                        "STALL-ANALYSIS | no video completed for %.1fs; "
+                        "inspect the latest HEALTH and GPU-HEALTH lines to "
+                        "identify extraction, CUDA, or composition blocking",
+                        now - last_completion_at,
+                    )
+                    last_stall_warning = now
+
                 if not active:
                     break
 
@@ -349,6 +504,15 @@ class BatchRunner:
                 for future in finished:
                     outcomes.append(future.result())
                     active.pop(future, None)
+                    last_completion_at = time.monotonic()
+        elapsed = time.monotonic() - batch_started
+        self.logger.info(
+            "THROUGHPUT | finished=%s/%s in %.1fs; average=%.2f videos/minute",
+            len(outcomes),
+            len(jobs),
+            elapsed,
+            (len(outcomes) * 60 / elapsed) if elapsed > 0 else 0.0,
+        )
         return outcomes
 
     def _claim_and_process(
@@ -435,17 +599,13 @@ class BatchRunner:
         finally:
             self._refresh_report()
 
-    def _refresh_report(self) -> None:
-        with self._report_lock:
-            try:
-                self.report.export(
-                    self.config,
-                    self.repository.list_jobs(
-                        input_root=self.config.input_dir
-                    ),
-                )
-            except OSError as error:
-                self.logger.warning(
-                    "Could not update Excel report (close it in Excel and retry): %s",
-                    error,
-                )
+    def _export_report(self) -> int:
+        jobs = self.repository.list_jobs(input_root=self.config.input_dir)
+        self.report.export(self.config, jobs)
+        return len(jobs)
+
+    def _refresh_report(self, *, wait: bool = False) -> None:
+        if wait:
+            self._report_writer.flush()
+        else:
+            self._report_writer.request()

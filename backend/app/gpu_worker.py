@@ -81,9 +81,12 @@ def _vram_metrics(torch: object) -> dict[str, float]:
 
 
 class _NvidiaSampler:
-    def __init__(self) -> None:
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
         self._stop = threading.Event()
         self._samples: list[tuple[float, float]] = []
+        self._started_at = time.monotonic()
+        self._last_heartbeat_at = self._started_at
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -107,7 +110,11 @@ class _NvidiaSampler:
         }
 
     def _run(self) -> None:
+        heartbeat_utilization: list[float] = []
+        latest_memory: float | None = None
         while not self._stop.is_set():
+            utilization: float | None = None
+            memory: float | None = None
             try:
                 result = subprocess.run(
                     [
@@ -120,7 +127,7 @@ class _NvidiaSampler:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=5,
+                    timeout=3,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     check=False,
                 )
@@ -129,9 +136,35 @@ class _NvidiaSampler:
                     float(value.strip()) for value in first_line.split(",")[:2]
                 )
                 self._samples.append((utilization, memory))
+                heartbeat_utilization.append(utilization)
+                latest_memory = memory
             except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-                return
-            self._stop.wait(0.75)
+                pass
+            now = time.monotonic()
+            if (
+                not self._stop.is_set()
+                and now - self._last_heartbeat_at >= 15.0
+            ):
+                _event(
+                    {
+                        "kind": "heartbeat",
+                        "request_id": self.request_id,
+                        "elapsed_seconds": round(now - self._started_at, 1),
+                        "gpu_utilization": round(
+                            sum(heartbeat_utilization)
+                            / len(heartbeat_utilization),
+                            1,
+                        )
+                        if heartbeat_utilization
+                        else "?",
+                        "memory_used_gb": round(latest_memory / 1024, 3)
+                        if latest_memory is not None
+                        else "?",
+                    }
+                )
+                heartbeat_utilization.clear()
+                self._last_heartbeat_at = now
+            self._stop.wait(2.0)
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -173,7 +206,7 @@ def _serve(args: argparse.Namespace) -> int:
             model = str(request.get("model") or args.model)
             inference_started = time.monotonic()
             torch.cuda.reset_peak_memory_stats(0)
-            sampler = _NvidiaSampler()
+            sampler = _NvidiaSampler(request_id)
             sampler.start()
             try:
                 vocals = engine.separate_vocals(
